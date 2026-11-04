@@ -841,4 +841,63 @@ where
     }
 }
 
+use crate::kernels::reduce;
+use crate::kernels::reduce_plan::{classify_reduce, ReducePlan};
+
+impl<T, D> DeviceVecdotAPI<T, T, T, D, D, D> for DeviceCuda
+where
+    Self: DeviceRawAPI<T, Raw = CudaBuffer<T>>
+        + DeviceRawAPI<MaybeUninit<T>, Raw = CudaBuffer<MaybeUninit<T>>>,
+    T: CudaDType,
+    D: DimAPI,
+{
+    fn vecdot(
+        &self,
+        c: &mut CudaBuffer<MaybeUninit<T>>,
+        lc: &Layout<D>,
+        a: &CudaBuffer<T>,
+        la: &Layout<D>,
+        b: &CudaBuffer<T>,
+        lb: &Layout<D>,
+        axes_a: &[isize],
+        axes_b: &[isize],
+    ) -> Result<()> {
+        // The trait takes no `order`: each device supplies its own default. This is the same value
+        // the CPU path receives from its caller.
+        let order: FlagOrder = self.default_order();
+
+        // Work on dynamic layouts: the split destroys static rank knowledge, and the classifier
+        // must see exactly the `Layout<IxD>` the CPU code sees so the port stays faithful.
+        let la_d = la.to_dim::<IxD>()?;
+        let lb_d = lb.to_dim::<IxD>()?;
+        let lc_d = lc.to_dim::<IxD>()?;
+
+        let plan = classify_reduce(&la_d, &lb_d, &lc_d, axes_a, axes_b, order)?;
+
+        match plan {
+            // One thread per output element, serial contraction, no cross-thread reduction.
+            ReducePlan::ContigM { .. } => {
+                let (las, lam) = la_d.dim_split_axes(axes_a)?;
+                let (lbs, lbm) = lb_d.dim_split_axes(axes_b)?;
+                // broadcast-align the output against the remaining axes, exactly as the planner did
+                let (lc_aligned, lam) = broadcast_layout_to_first(&lc_d, &lam, order)?;
+                let (lc_aligned, lbm) = broadcast_layout_to_first(&lc_aligned, &lbm, order)?;
+
+                reduce::vecdot_contig_m_launch(self, c, &lc_aligned, a, &las, &lam, b, &lbs, &lbm)
+            },
+
+            // Not yet. `ContigS` needs a block-per-output kernel plus the large-run gate; `General`
+            // needs a packing pass to a contiguous copy followed by a re-plan.
+            ReducePlan::ContigS { .. } => {
+                rstsr_raise!(UnImplemented, "cuda vecdot: contig_s plan not implemented yet")?
+            },
+            ReducePlan::General => {
+                rstsr_raise!(UnImplemented, "cuda vecdot: general plan (pack-then-reduce) not implemented yet")?
+            },
+        }
+    }
+}
+
+
+
 // /* #endregion */
