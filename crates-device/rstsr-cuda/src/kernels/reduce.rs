@@ -17,11 +17,20 @@
 //!
 //! # Accumulation order
 //!
-//! Eight private accumulators with the CPU's combine order — `((0 + (p0+p4)) + (p1+p5)) + (p2+p6)) +
-//! (p3+p7)`, then the tail — matching `unrolled_binary_reduce` in
-//! `rstsr-native-impl/src/cpu_serial/reduction.rs`. Reproducing that tree is the only way this kernel
-//! can produce results **bitwise identical** to the CPU device; a four-accumulator or warp-parallel
-//! variant would be device-deterministic but not CPU-identical.
+//! **One accumulator, contracted index ascending** — the CPU's `flag_contig_m` branch
+//! (`cpu_serial/vecdot.rs:110-135`) does `c[t] += a[t] * b[t]` once per contracted index, in
+//! increasing order, with no unrolling. Reproducing that is the only way this kernel can be
+//! **bitwise identical** to the CPU device.
+//!
+//! Two things that look like optimisations and both break parity:
+//!
+//! - **Eight accumulators.** That tree belongs to `flag_contig_s` / `unrolled_binary_reduce`, a
+//!   different branch. Mixing it in changes the last bits.
+//! - **FMA contraction.** `acc + x * y` becomes a single-rounding `fma` under NVRTC (fmad defaults
+//!   to on), while Rust performs two roundings. `__fadd_rn(acc, __fmul_rn(x, y))` forces the split.
+//!
+//! Neither costs anything measurable: the loop is DRAM-bound, one load pair per element, and a
+//! dependent fp64 add is ~26x shorter than the memory latency it hides behind.
 
 use crate::prelude_dev::*;
 use std::fmt::Write as _;
@@ -49,34 +58,17 @@ extern "C" __global__ void rstsr_vecdot_cm(
     rstsr_isz ia = (rstsr_isz)j * sa_out;
     rstsr_isz ib = (rstsr_isz)j * sb_out;
 
-    // Eight accumulators over congruence classes mod 8 -- the CPU's unrolled_binary_reduce shape,
-    // so the combine tree below can reproduce it exactly.
-    @T@ p0 = (@T@)0, p1 = (@T@)0, p2 = (@T@)0, p3 = (@T@)0;
-    @T@ p4 = (@T@)0, p5 = (@T@)0, p6 = (@T@)0, p7 = (@T@)0;
-
-    rstsr_usz m = 0;
-    while (n_contract - m >= 8) {
-        p0 += a[ia + (rstsr_isz)(m + 0) * sa] * b[ib + (rstsr_isz)(m + 0) * sb];
-        p1 += a[ia + (rstsr_isz)(m + 1) * sa] * b[ib + (rstsr_isz)(m + 1) * sb];
-        p2 += a[ia + (rstsr_isz)(m + 2) * sa] * b[ib + (rstsr_isz)(m + 2) * sb];
-        p3 += a[ia + (rstsr_isz)(m + 3) * sa] * b[ib + (rstsr_isz)(m + 3) * sb];
-        p4 += a[ia + (rstsr_isz)(m + 4) * sa] * b[ib + (rstsr_isz)(m + 4) * sb];
-        p5 += a[ia + (rstsr_isz)(m + 5) * sa] * b[ib + (rstsr_isz)(m + 5) * sb];
-        p6 += a[ia + (rstsr_isz)(m + 6) * sa] * b[ib + (rstsr_isz)(m + 6) * sb];
-        p7 += a[ia + (rstsr_isz)(m + 7) * sa] * b[ib + (rstsr_isz)(m + 7) * sb];
-        m += 8;
-    }
-
-    // combine order must match the CPU exactly
+    // One accumulator in contracted order: the CPU's flag_contig_m branch accumulates
+    // sequentially, so any unrolling here breaks bitwise parity. Do not "optimise" this into
+    // multiple accumulators without also deciding to give up CPU-identical results.
+    //
+    // __fmul_rn / __fadd_rn force two roundings. Plain `acc + x * y` contracts to a
+    // single-rounding FMA (fmad is on by default in NVRTC), which also breaks parity.
     @T@ acc = (@T@)0;
-    acc = acc + (p0 + p4);
-    acc = acc + (p1 + p5);
-    acc = acc + (p2 + p6);
-    acc = acc + (p3 + p7);
-
-    // tail, in order
-    for (; m < n_contract; ++m) {
-        acc = acc + a[ia + (rstsr_isz)m * sa] * b[ib + (rstsr_isz)m * sb];
+    for (rstsr_usz m = 0; m < n_contract; ++m) {
+        @T@ x = a[ia + (rstsr_isz)m * sa];
+        @T@ y = b[ib + (rstsr_isz)m * sb];
+        acc = __fadd_rn(acc, __fmul_rn(x, y));
     }
 
     c[j] = acc;

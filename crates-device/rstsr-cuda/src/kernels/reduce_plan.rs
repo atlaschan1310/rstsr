@@ -229,8 +229,7 @@ mod tests {
         let plan = classify_reduce(&la, &lb, &lc, &[1], &[1], RowMajor).unwrap();
         assert_eq!(plan.name(), "general");
     }
-
-    #[test]
+    
     #[test]
     fn plan_counts_partition_the_contracted_space() {
         // (shape_a, stride_a, contract_axis, shape_c, stride_c)
