@@ -71,7 +71,7 @@ extern "C" __global__ void rstsr_vecdot_cm(
         acc = __fadd_rn(acc, __fmul_rn(x, y));
     }
 
-    c[j] = 0.1;
+    c[j] = (double)sizeof(@T@);   // 8 = double compiled, 4 = float compiled
 }
 "#;
 
