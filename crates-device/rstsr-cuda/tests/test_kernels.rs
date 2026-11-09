@@ -606,4 +606,42 @@ fn vecdot_unsupported_plans_are_loud() {
     }
 }
 
+#[test]
+fn diagnose_vecdot_precision() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let (n_contract, n_out) = (1024usize, 4usize);
+
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((vecdot_probe_data(n_contract * n_out, 1), &dcpu)).into_shape([n_contract, n_out]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((vecdot_probe_data(n_contract * n_out, 2), &dcpu)).into_shape([n_contract, n_out]);
+
+    let a = a_cpu.to_device(&d);
+    let b = b_cpu.to_device(&d);
+    let gpu: Vec<f64> = host_vec1(&rt::vecdot(&a, &b, 0));
+
+    let av = host_vec1(&a_cpu);   // layout order: column-major blocks, i fastest
+    let bv = host_vec1(&b_cpu);
+
+    for j in 0..n_out {
+        // column j of an (n_contract, n_out) row-major tensor: indices j + m*n_out
+        let col = |v: &[f64]| (0..n_contract).map(|m| v[j + m * n_out]).collect::<Vec<_>>();
+        let (ca, cb) = (col(&av), col(&bv));
+
+        let exact: f64 = (0..n_contract).fold(0.0, |acc, m| acc + ca[m] * cb[m]);
+        let narrowed: f64 = (0..n_contract)
+            .fold(0.0, |acc, m| acc + (ca[m] as f32 as f64) * (cb[m] as f32 as f64));
+        let single: f32 = (0..n_contract).fold(0.0f32, |acc, m| acc + ca[m] as f32 * cb[m] as f32);
+
+        eprintln!(
+            "j={j}\n  gpu      {:.17e}\n  exact    {:.17e}  {}\n  narrowed {:.17e}  {}\n  single   {:.17e}  {}",
+            gpu[j], exact, gpu[j] == exact, narrowed, gpu[j] == narrowed,
+            single as f64, gpu[j] == single as f64
+        );
+    }
+}
+
+
 /* #endregion */
