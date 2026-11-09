@@ -622,7 +622,7 @@ fn diagnose_vecdot_precision() {
     let b = b_cpu.to_device(&d);
     let gpu: Vec<f64> = host_vec1(&rt::vecdot(&a, &b, 0));
 
-    let av = host_nd(&a_cpu);   // layout order: column-major blocks, i fastest
+    let av = host_nd(&a_cpu);   
     let bv = host_nd(&b_cpu);
 
     for j in 0..n_out {
