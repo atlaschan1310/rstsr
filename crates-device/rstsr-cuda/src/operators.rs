@@ -886,10 +886,14 @@ where
                 reduce::vecdot_contig_m_launch(self, c, &lc_aligned, a, &las, &lam, b, &lbs, &lbm)
             },
 
-            // Not yet. `ContigS` needs a block-per-output kernel plus the large-run gate; `General`
-            // needs a packing pass to a contiguous copy followed by a re-plan.
             ReducePlan::ContigS { .. } => {
-                rstsr_raise!(UnImplemented, "cuda vecdot: contig_s plan not implemented yet")?
+                let (las, lam) = la_d.dim_split_axes(axes_a)?;
+                let (lbs, lbm) = lb_d.dim_split_axes(axes_b)?;
+
+                let (lc_aligned, lam) = broadcast_layout_to_first(&lc_d, &lam, order)?;
+                let (lc_aligned, lbm) = broadcast_layout_to_first(&lc_aligned, &lbm, order)?;
+
+                reduce::vecdot_contig_s_launch(self, c, &lc_aligned, a, &las, &lam, b, &lbs, &lbm)
             },
             ReducePlan::General => {
                 rstsr_raise!(UnImplemented, "cuda vecdot: general plan (pack-then-reduce) not implemented yet")?
