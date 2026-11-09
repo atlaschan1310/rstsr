@@ -71,7 +71,7 @@ extern "C" __global__ void rstsr_vecdot_cm(
         acc = __fadd_rn(acc, __fmul_rn(x, y));
     }
 
-    c[j] = acc;
+    c[j] = 0.1;
 }
 "#;
 
@@ -183,8 +183,6 @@ where
     let exec = device.stream();
     let _ga = crate::kernel::order_input(a, exec)?;
     let _gb = crate::kernel::order_input(b, exec)?;
-    eprintln!("CNAME={:?}", T::CNAME);
-    eprintln!("{}", render(VECDOT_CM_ENTRY, &[("@T@", T::CNAME)]));
 
     let f = reduce_function(device, "rstsr_vecdot_cm", T::INCLUDES, T::CNAME, || {
         render(VECDOT_CM_ENTRY, &[("@T@", T::CNAME)])
