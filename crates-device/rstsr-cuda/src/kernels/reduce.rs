@@ -68,10 +68,10 @@ extern "C" __global__ void rstsr_vecdot_cm(
     for (rstsr_usz m = 0; m < n_contract; ++m) {
         @T@ x = a[ia + (rstsr_isz)m * sa];
         @T@ y = b[ib + (rstsr_isz)m * sb];
-        acc = __fadd_rn(acc, __fmul_rn(x, y));
+        acc = __dadd_rn(acc, __dmul_rn(x, y));
     }
 
-    c[j] = (double)sizeof(@T@);   // 8 = double compiled, 4 = float compiled
+    c[j] = acc;
 }
 "#;
 
