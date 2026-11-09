@@ -622,8 +622,8 @@ fn diagnose_vecdot_precision() {
     let b = b_cpu.to_device(&d);
     let gpu: Vec<f64> = host_vec1(&rt::vecdot(&a, &b, 0));
 
-    let av = host_vec1(&a_cpu);   // layout order: column-major blocks, i fastest
-    let bv = host_vec1(&b_cpu);
+    let av = host_nd(&a_cpu);   // layout order: column-major blocks, i fastest
+    let bv = host_nd(&b_cpu);
 
     for j in 0..n_out {
         // column j of an (n_contract, n_out) row-major tensor: indices j + m*n_out
