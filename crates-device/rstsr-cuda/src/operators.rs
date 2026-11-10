@@ -848,7 +848,7 @@ impl<T, D> DeviceVecdotAPI<T, T, T, D, D, D> for DeviceCuda
 where
     Self: DeviceRawAPI<T, Raw = CudaBuffer<T>>
         + DeviceRawAPI<MaybeUninit<T>, Raw = CudaBuffer<MaybeUninit<T>>>,
-    T: CudaDType,
+    T: CudaDType + reduce::RnOps,
     D: DimAPI,
 {
     fn vecdot(

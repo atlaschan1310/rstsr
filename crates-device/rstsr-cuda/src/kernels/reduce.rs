@@ -231,7 +231,7 @@ pub(crate) fn vecdot_contig_m_launch<T>(
     lbm: &Layout<IxD>,
 ) -> Result<()>
 where
-    T: CudaDType,
+    T: CudaDType + RnOps,
 {
     // --- preconditions of this slice -------------------------------------------------------------
     if las.ndim() != 1 || lbs.ndim() != 1 {

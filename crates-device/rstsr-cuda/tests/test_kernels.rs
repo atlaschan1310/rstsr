@@ -477,7 +477,9 @@ fn inplace_after_stream_retag() {
 
 /* #endregion */
 
-/* #region vecdot (contig_m slice) */
+/* #region vecdot */
+
+/// Deterministic f64 in `[-4, 4)` with a full mantissa.
 fn vecdot_probe_data(n: usize, seed: u64) -> Vec<f64> {
     let mut s = seed | 1;
     (0..n)
@@ -489,12 +491,14 @@ fn vecdot_probe_data(n: usize, seed: u64) -> Vec<f64> {
         .collect()
 }
 
-/// One `(n_contract, n_out)` parity case, `(i, p)` orientation, contract axis 0.
-fn vecdot_case(n_contract: usize, n_out: usize, seed: u64) {
+/// `(n_contract, n_out)` with the contraction on **axis 0** — `(i, p)` orientation.
+///
+/// Contracted stride is `n_out`, output stride is 1, so `flag_contig_s` is false and
+/// `flag_contig_m` is true on both devices: one accumulator per output, sequential.
+fn vecdot_contig_m_case(n_contract: usize, n_out: usize, seed: u64) {
     let d = DeviceCuda::new(0);
-    // Pin the host device: `DeviceCpu` resolves to `DeviceFaer` under
-    // `faer_as_default`, whose impls are feature-gated (same reason as in
-    // `assign_cast_pairs`).
+    // Pin the host device: `DeviceCpu` resolves to `DeviceFaer` under `faer_as_default`, whose
+    // impls are feature-gated (same reason as in `assign_cast_pairs`).
     let dcpu = DeviceCpuSerial::default();
 
     let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
@@ -503,32 +507,59 @@ fn vecdot_case(n_contract: usize, n_out: usize, seed: u64) {
         rt::asarray((vecdot_probe_data(n_contract * n_out, seed ^ 0x9e37_79b9), &dcpu))
             .into_shape([n_contract, n_out]);
 
-    // (i, p), contract axis 0 => contracted stride = n_out, output stride = 1
-    // => flag_contig_s false, flag_contig_m true on BOTH devices.
     let want: Vec<f64> = host_vec1(&rt::vecdot(&a_cpu, &b_cpu, 0));
 
     let a = a_cpu.to_device(&d);
     let b = b_cpu.to_device(&d);
     let got: Vec<f64> = host_vec1(&rt::vecdot(&a, &b, 0));
 
-    assert_eq!(got.len(), n_out, "output length wrong for ({n_contract}, {n_out})");
+    assert_eq!(got.len(), n_out, "output length wrong for (n_contract={n_contract}, n_out={n_out})");
     assert_eq!(
-        got,
-        want,
-        "vecdot parity failed for (n_contract={n_contract}, n_out={n_out}). \
-         Differences of ~1e-16 relative on most elements => the kernel still contracts to FMA. \
-         Larger, scattered differences => the accumulation order is not the CPU's sequential one."
+        got, want,
+        "contig_m parity failed for ({n_contract}, {n_out}). \
+         ~1e-16 relative => the kernel contracts to FMA or uses a different tree. \
+         ~1e-6 relative => something is computing in f32 (check the @ADD@/@MUL@ mapping). \
+         O(1) differences => addressing, not arithmetic."
+    );
+}
+
+/// `(n_p, n_i)` with the contraction on the **last axis** — `(p, i)` orientation.
+///
+/// This is the layout ordinary C-order code produces, and it takes the *other* CPU branch:
+/// `flag_contig_s` runs `unrolled_binary_reduce` over the contiguous run — eight congruence-class
+/// accumulators, combined as `(p0+p4) (p1+p5) (p2+p6) (p3+p7)`, then a tail.
+fn vecdot_contig_s_case(n_p: usize, n_i: usize, seed: u64) {
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((vecdot_probe_data(n_p * n_i, seed), &dcpu)).into_shape([n_p, n_i]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((vecdot_probe_data(n_p * n_i, seed ^ 0x5bf0_3635), &dcpu)).into_shape([n_p, n_i]);
+
+    let want: Vec<f64> = host_vec1(&rt::vecdot(&a_cpu, &b_cpu, 1));
+
+    let a = a_cpu.to_device(&d);
+    let b = b_cpu.to_device(&d);
+    let got: Vec<f64> = host_vec1(&rt::vecdot(&a, &b, 1));
+
+    assert_eq!(got.len(), n_p, "output length wrong for (n_p={n_p}, n_i={n_i})");
+    assert_eq!(
+        got, want,
+        "contig_s parity failed for ({n_p}, {n_i}). \
+         Eight accumulators combined as (p0+p4),(p1+p5),(p2+p6),(p3+p7) then a tail; \
+         a single-accumulator kernel differs here in the last bits, and a block reduction \
+         differs in a way that depends on the block size."
     );
 }
 
 #[test]
 fn vecdot_contig_m_vs_cpu() {
     require_cuda!();
-    // n_out covers: an exact multiple of the 256-thread launch block, a ragged
-    // tail, and a single-element contraction (where the CPU's own branches
-    // degenerate to the same single multiply-add).
+    // an exact multiple of the 256-thread launch block, a ragged tail, and a
+    // single-element contraction (where the CPU's branches degenerate to one multiply-add)
     for (n_contract, n_out) in [(1024usize, 256usize), (4096, 17), (1, 1000), (37, 300)] {
-        vecdot_case(n_contract, n_out, (n_contract as u64) * 131 + n_out as u64);
+        vecdot_contig_m_case(n_contract, n_out, (n_contract as u64) * 131 + n_out as u64);
     }
 }
 
@@ -544,10 +575,10 @@ fn vecdot_contig_m_offset_view() {
     let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
         rt::asarray((vecdot_probe_data(n_contract * n_out, 6), &dcpu)).into_shape([n_contract, n_out]);
 
-    // Drop the first three contracted entries: offset != 0, strides unchanged,
-    // so this is still contig_m. The launcher folds `las.offset()`/`lbs.offset()`
-    // into the base pointer; a double-count or a dropped offset shows up HERE and
-    // nowhere else, and it shows up as wrong numbers rather than as an error.
+    // Drop the first three contracted entries: offset != 0, strides unchanged, so this is still
+    // contig_m. The launcher folds `las.offset()`/`lbs.offset()` into the base pointer; a
+    // double-count or a dropped offset shows up HERE and nowhere else, as wrong numbers rather
+    // than as an error.
     let a_view = a_cpu.i(3..);
     let b_view = b_cpu.i(3..);
     let want: Vec<f64> = host_vec1(&rt::vecdot(&a_view, &b_view, 0));
@@ -559,55 +590,21 @@ fn vecdot_contig_m_offset_view() {
     assert_eq!(got.len(), n_out);
     assert_eq!(
         got, want,
-        "offset-view parity failed: the base pointer is off by a multiple of the \
-         element offset (check whether dim_split_axes preserves the parent offset, \
-         and whether the launcher then adds it a second time)"
+        "offset-view parity failed: the base pointer is off by a multiple of the element offset \
+         (check whether dim_split_axes preserves the parent offset, and whether the launcher \
+         then adds it a second time)"
     );
 }
 
+/// Independent oracle: recompute the contraction in plain Rust and compare bit-for-bit.
+///
+/// `vecdot_contig_m_case` compares GPU against the CPU *device*. This one compares against a
+/// hand-written fold, so a defect shared by both backends (a promotion table, a shared helper, a
+/// wrong layout convention) cannot hide. It is also the test that caught the `__f*_rn` /
+/// `__d*_rn` overload: it prints nothing now, but if it fails, compute the same sum in `f32` and
+/// compare — a match there means the arithmetic is single-precision.
 #[test]
-fn vecdot_unsupported_plans_are_loud() {
-    require_cuda!();
-    let d = DeviceCuda::new(0);
-    // Only the classifier is under test here, so the arrays are kept small; the
-    // run length (n_i) is what must exceed 4 * BLOCK = 1024 to reach contig_s.
-    let (n_p, n_i) = (8usize, 4096usize);
-
-    let a: Tensor<f64, _, _> = rt::arange((0., (n_p * n_i) as f64, 1., &d)).into_shape([n_p, n_i]);
-    let b: Tensor<f64, _, _> =
-        rt::arange((1., (n_p * n_i) as f64 + 1., 1., &d)).into_shape([n_p, n_i]);
-
-    // (p, i) contracted on the LAST axis: long contiguous run => contig_s.
-    // Not implemented yet, and it must say so rather than fall back to host or
-    // silently pick the wrong kernel.
-    match rt::vecdot_f(&a, &b, 1) {
-        Ok(_) => panic!("contig_s plan should be UnImplemented, but it computed a result"),
-        Err(e) => assert!(
-            format!("{e}").contains("contig_s"),
-            "contig_s should be reported by name, got: {e}"
-        ),
-    }
-
-    // Both axes stepped => neither a contiguous contracted run nor a contiguous
-    // output axis => general (pack-then-reduce), also not implemented.
-    // NOTE: if the tuple-of-`SliceI` indexer form does not compile against your
-    // indexing API, delete this block -- the contig_s assertion above is the one
-    // that matters today.
-    let r = SliceI::new(None::<isize>, None::<isize>, Some(2isize));
-    let a2: Tensor<f64, _, _> = rt::arange((0., (512. * 512.) as f64, 1., &d)).into_shape([512, 512]);
-    let b2: Tensor<f64, _, _> =
-        rt::arange((1., (512. * 512.) as f64 + 1., 1., &d)).into_shape([512, 512]);
-    match rt::vecdot_f(&a2.i((r, r)), &b2.i((r, r)), 0) {
-        Ok(_) => panic!("general plan should be UnImplemented, but it computed a result"),
-        Err(e) => assert!(
-            format!("{e}").contains("general"),
-            "general plan should be reported by name, got: {e}"
-        ),
-    }
-}
-
-#[test]
-fn diagnose_vecdot_precision() {
+fn vecdot_contig_m_independent_oracle() {
     require_cuda!();
     let d = DeviceCuda::new(0);
     let dcpu = DeviceCpuSerial::default();
@@ -620,28 +617,92 @@ fn diagnose_vecdot_precision() {
 
     let a = a_cpu.to_device(&d);
     let b = b_cpu.to_device(&d);
-    let gpu: Vec<f64> = host_vec1(&rt::vecdot(&a, &b, 0));
+    let got: Vec<f64> = host_vec1(&rt::vecdot(&a, &b, 0));
 
-    let av = host_nd(&a_cpu);   
+    // host_nd returns C-order, so column j of an (n_contract, n_out) tensor is j + m * n_out.
+    let av = host_nd(&a_cpu);
     let bv = host_nd(&b_cpu);
 
     for j in 0..n_out {
-        // column j of an (n_contract, n_out) row-major tensor: indices j + m*n_out
-        let col = |v: &[f64]| (0..n_contract).map(|m| v[j + m * n_out]).collect::<Vec<_>>();
-        let (ca, cb) = (col(&av), col(&bv));
-
-        let exact: f64 = (0..n_contract).fold(0.0, |acc, m| acc + ca[m] * cb[m]);
-        let narrowed: f64 = (0..n_contract)
-            .fold(0.0, |acc, m| acc + (ca[m] as f32 as f64) * (cb[m] as f32 as f64));
-        let single: f32 = (0..n_contract).fold(0.0f32, |acc, m| acc + ca[m] as f32 * cb[m] as f32);
-
-        eprintln!(
-            "j={j}\n  gpu      {:.17e}\n  exact    {:.17e}  {}\n  narrowed {:.17e}  {}\n  single   {:.17e}  {}",
-            gpu[j], exact, gpu[j] == exact, narrowed, gpu[j] == narrowed,
-            single as f64, gpu[j] == single as f64
-        );
+        let exact: f64 = (0..n_contract).fold(0.0, |acc, m| acc + av[j + m * n_out] * bv[j + m * n_out]);
+        assert_eq!(got[j], exact, "oracle mismatch at output {j}: the fold is m-ascending, one term at a time");
     }
 }
+
+#[test]
+fn vecdot_contig_s_vs_cpu() {
+    require_cuda!();
+    // n_i must exceed 4 * BLOCK = 1024 to pass the classifier's contig_s gate.
+    //   4096: exact multiple of 8, no tail
+    //   4093: exercises the <=7 tail loop
+    //   1024: exactly at the gate
+    //      1: n_p = 1, a single output, still contig_s
+    for (n_p, n_i) in [(37usize, 4096usize), (37, 4093), (11, 1024), (1, 2048)] {
+        vecdot_contig_s_case(n_p, n_i, (n_p as u64) * 977 + n_i as u64);
+    }
+}
+
+/// The classifier's gate, at `4 * BLOCK - 1`.
+///
+/// A run of 1023 is contiguous but shorter than four blocks, so `ContigS` must not be chosen for a
+/// block-per-output kernel. Either a plan is picked and it is still bit-exact, or the call is
+/// refused by name — what must never happen is a silent switch to a different accumulation order.
+#[test]
+fn vecdot_contig_s_gate_boundary() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let (n_p, n_i) = (8usize, 1023usize);
+
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((vecdot_probe_data(n_p * n_i, 3), &dcpu)).into_shape([n_p, n_i]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((vecdot_probe_data(n_p * n_i, 4), &dcpu)).into_shape([n_p, n_i]);
+
+    let a = a_cpu.to_device(&d);
+    let b = b_cpu.to_device(&d);
+
+    match rt::vecdot_f(&a, &b, 1) {
+        Ok(c_gpu) => {
+            let want: Vec<f64> = host_vec1(&rt::vecdot(&a_cpu, &b_cpu, 1));
+            assert_eq!(host_vec1(&c_gpu), want, "short-run parity failed at the contig_s gate boundary");
+        },
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("contig_s") || msg.contains("general"),
+                "unexpected error at the gate boundary: {e}"
+            );
+        },
+    }
+}
+
+/// `General` is still unimplemented, and it has to say so by name.
+///
+/// Packed-then-reduced needs a pass that allocates two temporaries, and there is no pooling
+/// allocator yet — so the policy question ("when do we double the caller's memory") is open. A
+/// loud refusal is the correct behaviour; a silent host fallback or a scalar-loop kernel would be
+/// 10-30x off peak with nothing in the output to say so.
+#[test]
+fn vecdot_general_is_loud() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+
+    // step 2 on both axes: neither a contiguous contracted run nor a contiguous output axis
+    let r = SliceI::new(None::<isize>, None::<isize>, Some(2isize));
+    let a: Tensor<f64, _, _> = rt::arange((0., (512. * 512.) as f64, 1., &d)).into_shape([512, 512]);
+    let b: Tensor<f64, _, _> = rt::arange((1., (512. * 512.) as f64 + 1., 1., &d)).into_shape([512, 512]);
+
+    match rt::vecdot_f(&a.i((r, r)), &b.i((r, r)), 0) {
+        Ok(_) => panic!("general plan should be UnImplemented, but it computed a result"),
+        Err(e) => assert!(
+            format!("{e}").contains("general"),
+            "general plan should be reported by name, got: {e}"
+        ),
+    }
+}
+/* #endregion */
+
 
 
 /* #endregion */
