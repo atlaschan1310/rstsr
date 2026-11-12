@@ -479,6 +479,8 @@ fn inplace_after_stream_retag() {
 
 /* #region vecdot */
 
+/* #region vecdot */
+
 /// Deterministic, deliberately non-representable f64 data.
 fn vecdot_probe_data(n: usize, seed: u64) -> Vec<f64> {
     let mut s = seed | 1;
@@ -584,8 +586,11 @@ fn vecdot_case(rows: usize, cols: usize, axis: isize, exact: bool) {
 }
 
 /// Every lane count, on data where the summation order cannot matter.
+///
+/// Named for what it asserts, not for the fixture it uses: `vecdot_exact_data` is the generator
+/// below and a test of the same name would shadow it.
 #[test]
-fn vecdot_exact_data() {
+fn vecdot_all_lane_counts_exact() {
     require_cuda!();
     for &(rows, cols, axis) in VECDOT_CASES {
         vecdot_case(rows, cols, axis, true);
@@ -594,7 +599,7 @@ fn vecdot_exact_data() {
 
 /// Every lane count, on data where only the tolerance applies.
 #[test]
-fn vecdot_vs_cpu() {
+fn vecdot_all_lane_counts_vs_cpu() {
     require_cuda!();
     for &(rows, cols, axis) in VECDOT_CASES {
         vecdot_case(rows, cols, axis, false);
@@ -662,8 +667,6 @@ fn vecdot_refuses_unplannable_shapes() {
         },
     }
 }
-
-
 
 
 /* #endregion */
