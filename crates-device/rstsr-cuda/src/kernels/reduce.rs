@@ -1,36 +1,52 @@
 //! Reduction kernels.
 //!
-//! First slice: `vecdot` in the `ContigM` shape — **one thread per output element**, each thread
-//! walking the contracted axis serially with private accumulators. No cross-thread communication at
-//! all, so the sum is order-stable by construction and every element of the contraction is visited in
-//! a fixed order.
+//! One kernel, `vecdot` (`pi,pi->p`), parameterised by the plan's `lanes` / `outputs_per_block` pair
+//! from [`super::reduce_plan`]. There is no longer a `ContigS` kernel and a `ContigM` kernel: those
+//! names now describe the two ends of the same source, and which end you get is decided by
+//! `classify_reduce`, not by a branch here.
 //!
-//! Shape admitted here (everything else returns `UnImplemented`):
+//! # Thread mapping
 //!
-//! - both operands rank 2 after the axis split, one contracted axis and one output axis each
-//! - the **output axis is unit-stride** in both operands (`(i, p)` layout — this is `ContigM`)
-//! - the output tensor is contiguous, so output addressing is just `c[j]`
-//! - one dtype for a, b and c; `f32` / `f64` (f16/bf16 once the accumulate semantics are settled)
+//! ```text
+//! lane   = threadIdx.x & (LANES - 1)                        // low bits: the unit-stride axis
+//! output = blockIdx.x * OPB + (threadIdx.x >> LOG2_LANES)    // high bits: which output
+//! ```
 //!
-//! This is exactly `pi,pi->p` on an `(i, p)` array. The `(p, i)` orientation classifies as `ContigS`
-//! and is not handled here yet.
+//! Lane in the **low** bits is the whole design. It puts consecutive lanes on consecutive addresses
+//! when the contracted axis is unit-stride, and — just as important — it keeps the lanes that share
+//! an output inside one warp, which is what lets the tree be a `__shfl_down_sync` chain instead of a
+//! shared-memory reduction. CuPy does the opposite (`output = tid & (block_stride - 1)`) and pays for
+//! it with a shared-memory tree in every reduction it runs.
 //!
-//! # Accumulation order
+//! # Two stages, one of which is usually compiled out
 //!
-//! **One accumulator, contracted index ascending** — the CPU's `flag_contig_m` branch
-//! (`cpu_serial/vecdot.rs:110-135`) does `c[t] += a[t] * b[t]` once per contracted index, in
-//! increasing order, with no unrolling. Reproducing that is the only way this kernel can be
-//! **bitwise identical** to the CPU device.
+//! - **Stage 1** butterflies over the lanes of one output, with offsets below `min(LANES, warpSize)`.
+//!   When `LANES < warpSize` several outputs share a warp, so the cross-group value the shuffle
+//!   still delivers is discarded with `lane + off < LANES` rather than by making the loop divergent.
+//! - **Stage 2** appears only when one output spans more than one warp (`LANES > warpSize`): each
+//!   warp's partial goes to shared memory and the first warp of each output's group finishes the
+//!   reduction. `LANES` is a compile-time token, so for `LANES <= 32` the whole stage — shared array
+//!   included — is dead code and disappears.
 //!
-//! Two things that look like optimisations and both break parity:
+//! # The guard is not a `return`
 //!
-//! - **Eight accumulators.** That tree belongs to `flag_contig_s` / `unrolled_binary_reduce`, a
-//!   different branch. Mixing it in changes the last bits.
-//! - **FMA contraction.** `acc + x * y` becomes a single-rounding `fma` under NVRTC (fmad defaults
-//!   to on), while Rust performs two roundings. `__fadd_rn(acc, __fmul_rn(x, y))` forces the split.
+//! `if (j >= n_out) return;` would take part of a warp out of the shuffles below and make the mask
+//! undefined. The guard wraps only the accumulation and the final store; an out-of-range thread keeps
+//! `acc == 0`, participates in the tree, and writes nothing. This matters as soon as
+//! `outputs_per_block > 1`, i.e. whenever several outputs share a warp.
 //!
-//! Neither costs anything measurable: the loop is DRAM-bound, one load pair per element, and a
-//! dependent fp64 add is ~26x shorter than the memory latency it hides behind.
+//! # Arithmetic
+//!
+//! `acc + x * y` as written — NVRTC contracts it to a single-rounding FMA. No CPU parity is claimed,
+//! so `__dadd_rn` / `__dmul_rn` are not needed; see `reduce_plan`'s module docs.
+//!
+//! # Reproducibility
+//!
+//! The accumulation order is fixed by `LANES` and `n_contract`, both functions of the shape, so the
+//! same input on the same binary gives the same bits. `__activemask()` is used instead of a literal
+//! mask because the mask width differs between NVIDIA (32) and CDNA (64); it is only meaningful
+//! because `__syncwarp()` forces the warp back together after the output guard, which is divergent
+//! whenever several outputs share a warp.
 
 use crate::prelude_dev::*;
 use std::fmt::Write as _;
@@ -38,37 +54,17 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaFunction;
 use crate::dtype::CudaDType;
+use super::reduce_plan::{ReducePlan, BLOCK};
 
-/// Rounding-mode intrinsics per dtype.
+/// Largest number of warps a block can contain, assuming a warp is at least 32 lanes.
 ///
-/// `__fadd_rn` / `__fmul_rn` are overloaded on `float` **and** `double`. Under NVRTC a missing
-/// `double` overload does not error — the arguments are implicitly converted to `float`, the
-/// operation runs in single precision, and the result converts back. The source still reads
-/// correctly against a `double acc`, `sizeof` is still 8, and `0.1` still round-trips; only the
-/// mantissa is gone. The `d`-prefixed names have no `float` counterpart, so they cannot do that.
-///
-/// Widening is silent too: `__dmul_rn(float, float)` compiles and computes in `double`. So the rule
-/// is not "always use `d`" — it is **the intrinsic must match the CPU's arithmetic type**, because
-/// bit-parity with the CPU is the guarantee this backend documents. Spelling the mapping out per
-/// dtype makes a new dtype state its arithmetic instead of inheriting f64's.
-pub(crate) trait RnOps {
-    const MUL: &'static str;
-    const ADD: &'static str;
-}
+/// Only a shared-array bound; the real warp count comes from the `warpSize` builtin.
+const MAX_WARPS_PER_BLOCK: usize = BLOCK / 32;
 
-impl RnOps for f64 {
-    const MUL: &'static str = "__dmul_rn";
-    const ADD: &'static str = "__dadd_rn";
-}
-
-impl RnOps for f32 {
-    const MUL: &'static str = "__fmul_rn";
-    const ADD: &'static str = "__fadd_rn";
-}
-
-/// Kernel body. Token substitution uses `@NAME@` (see `render`).
-const VECDOT_CM_ENTRY: &str = r#"
-extern "C" __global__ void rstsr_vecdot_cm(
+/// Kernel body. `@NAME@` tokens are substituted by [`render`]; the plan's geometry is baked in, so
+/// `LANES`, `LOG2_LANES` and `OPB` are compile-time constants.
+const VECDOT_ENTRY: &str = r#"
+extern "C" __global__ void rstsr_vecdot(
     @T@* __restrict__ c,
     const @T@* __restrict__ a,
     const @T@* __restrict__ b,
@@ -79,84 +75,56 @@ extern "C" __global__ void rstsr_vecdot_cm(
     rstsr_isz sa_out,  // output-axis stride of a, elements
     rstsr_isz sb_out)  // output-axis stride of b, elements
 {
-    rstsr_usz j = (rstsr_usz)blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n_out) return;
+    const rstsr_usz lane = (rstsr_usz)threadIdx.x & (@LANES@ - 1u);
+    const rstsr_usz j = (rstsr_usz)blockIdx.x * @OPB@ + ((rstsr_usz)threadIdx.x >> @LOG2_LANES@);
 
-    // base of this output's two rows
-    rstsr_isz ia = (rstsr_isz)j * sa_out;
-    rstsr_isz ib = (rstsr_isz)j * sb_out;
+    @T@ acc = (@T@)0;
+    if (j < n_out) {
+        const rstsr_isz ia = (rstsr_isz)j * sa_out;
+        const rstsr_isz ib = (rstsr_isz)j * sb_out;
+        for (rstsr_usz m = lane; m < n_contract; m += @LANES@) {
+            acc = acc + a[ia + (rstsr_isz)m * sa] * b[ib + (rstsr_isz)m * sb];
+        }
+    }
 
-    // One accumulator in contracted order: the CPU's flag_contig_m branch accumulates
-    // sequentially, so any unrolling here breaks bitwise parity. Do not "optimise" this into
-    // multiple accumulators without also deciding to give up CPU-identical results.
+    // Stage 1: within a warp. Offsets never reach the next output's group when LANES < warpSize, and
+    // the mask term throws away the cross-group value the shuffle still delivers.
     //
-    // @ADD@ / @MUL@ resolve per dtype (see `RnOps`): the intrinsics force two roundings, where a
-    // plain `acc + x * y` would contract to a single-rounding FMA (fmad defaults to on in NVRTC).
-    @T@ acc = (@T@)0;
-    for (rstsr_usz m = 0; m < n_contract; ++m) {
-        @T@ x = a[ia + (rstsr_isz)m * sa];
-        @T@ y = b[ib + (rstsr_isz)m * sb];
-        acc = @ADD@(acc, @MUL@(x, y));
+    // `__syncwarp()` is not decoration. When LANES < warpSize several outputs share a warp, so the
+    // guard above is divergent *within* the warp on the last block. Since Volta the hardware may not
+    // reconverge at the end of a divergent region on its own, and `__activemask()` would then return
+    // a partial set — the shuffle would silently read lanes that never participated. Forcing the
+    // reconvergence here is the portable fix, and it is a no-op when the warp is already converged.
+    __syncwarp();
+    const int ws = warpSize;
+    for (int off = (@LANES@ <= 32 ? (@LANES@ >> 1) : (ws >> 1)); off > 0; off >>= 1) {
+        @T@ other = __shfl_down_sync(__activemask(), acc, off);
+        acc = acc + (((rstsr_usz)off + lane < @LANES@) ? other : (@T@)0);
     }
 
-    c[j] = acc;
-}
-"#;
+    // Stage 2: only when one output spans several warps. Statically dead for LANES <= 32.
+    const int nw = @LANES@ / ws;
+    if (@LANES@ > 32 && nw > 1) {
+        __shared__ @T@ wpart[@MAXW@];
+        const int tl = (int)((unsigned)threadIdx.x & (unsigned)(ws - 1));
+        const int wid = (int)((unsigned)threadIdx.x / (unsigned)ws);
+        if (tl == 0) wpart[wid] = acc;
+        __syncthreads();
 
-/// `ContigS`: one thread per output, the CPU's `unrolled_binary_reduce` tree reproduced exactly.
-///
-/// The tree is the whole point. `cpu_serial/vecdot.rs:86-101` (`flag_contig_s`) computes each
-/// contiguous run with eight congruence-class accumulators, combines them as
-/// `acc += (p0+p4); acc += (p1+p5); acc += (p2+p6); acc += (p3+p7);`, then adds the ≤7 tail
-/// elements in order. Any deviation is visible in the last bits, which is why the earlier
-/// single-accumulator `ContigM` kernel is *not* reusable here.
-const VECDOT_CS_ENTRY: &str = r#"
-extern "C" __global__ void rstsr_vecdot_cs(
-    @T@* __restrict__ c,
-    const @T@* __restrict__ a,
-    const @T@* __restrict__ b,
-    rstsr_usz n_out,
-    rstsr_usz n_contract,
-    rstsr_isz sa,      // contracted-axis stride of a (== 1 for a contiguous run)
-    rstsr_isz sb,
-    rstsr_isz sa_out,  // output-axis stride of a (== n_contract for a (p, i) layout)
-    rstsr_isz sb_out)
-{
-    rstsr_usz j = (rstsr_usz)blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n_out) return;
-
-    rstsr_isz ia = (rstsr_isz)j * sa_out;
-    rstsr_isz ib = (rstsr_isz)j * sb_out;
-
-    // Eight congruence classes, exactly as `unrolled_binary_reduce` does it.
-    @T@ p0 = (@T@)0, p1 = (@T@)0, p2 = (@T@)0, p3 = (@T@)0;
-    @T@ p4 = (@T@)0, p5 = (@T@)0, p6 = (@T@)0, p7 = (@T@)0;
-
-    rstsr_usz m = 0;
-    for (; n_contract - m >= 8; m += 8) {
-        p0 = @ADD@(p0, @MUL@(a[ia + (rstsr_isz)(m + 0) * sa], b[ib + (rstsr_isz)(m + 0) * sb]));
-        p1 = @ADD@(p1, @MUL@(a[ia + (rstsr_isz)(m + 1) * sa], b[ib + (rstsr_isz)(m + 1) * sb]));
-        p2 = @ADD@(p2, @MUL@(a[ia + (rstsr_isz)(m + 2) * sa], b[ib + (rstsr_isz)(m + 2) * sb]));
-        p3 = @ADD@(p3, @MUL@(a[ia + (rstsr_isz)(m + 3) * sa], b[ib + (rstsr_isz)(m + 3) * sb]));
-        p4 = @ADD@(p4, @MUL@(a[ia + (rstsr_isz)(m + 4) * sa], b[ib + (rstsr_isz)(m + 4) * sb]));
-        p5 = @ADD@(p5, @MUL@(a[ia + (rstsr_isz)(m + 5) * sa], b[ib + (rstsr_isz)(m + 5) * sb]));
-        p6 = @ADD@(p6, @MUL@(a[ia + (rstsr_isz)(m + 6) * sa], b[ib + (rstsr_isz)(m + 6) * sb]));
-        p7 = @ADD@(p7, @MUL@(a[ia + (rstsr_isz)(m + 7) * sa], b[ib + (rstsr_isz)(m + 7) * sb]));
+        if (wid % nw == 0) {
+            // Every lane of this warp runs: the butterfly below uses a full-warp mask.
+            @T@ v = (tl < nw) ? wpart[(wid / nw) * nw + tl] : (@T@)0;
+            for (int off = nw >> 1; off > 0; off >>= 1) {
+                @T@ o = __shfl_down_sync(__activemask(), v, off);
+                v = v + (((int)tl + off < nw) ? o : (@T@)0);
+            }
+            if (tl == 0 && j < n_out) c[j] = v;
+        }
+        return;
     }
 
-    // Combine order is part of the contract. Do not reorder, do not fold into one accumulator.
-    @T@ acc = (@T@)0;
-    acc = @ADD@(acc, @ADD@(p0, p4));
-    acc = @ADD@(acc, @ADD@(p1, p5));
-    acc = @ADD@(acc, @ADD@(p2, p6));
-    acc = @ADD@(acc, @ADD@(p3, p7));
-
-    // Tail, in order, at most 7 elements.
-    for (; m < n_contract; ++m) {
-        acc = @ADD@(acc, @MUL@(a[ia + (rstsr_isz)m * sa], b[ib + (rstsr_isz)m * sb]));
-    }
-
-    c[j] = acc;
+    // No cross-warp stage: lane 0 of each group holds its output's total.
+    if (lane == 0 && j < n_out) c[j] = acc;
 }
 "#;
 
@@ -190,10 +158,10 @@ fn assemble(includes: &[&str], body: &str) -> String {
 
 /// Compile-or-fetch the reduction entry, interned per ordinal on the specialization discriminator.
 ///
-/// Same shape as `kernels::elementwise::planned_function`; that one is private to its module, so
-/// this is a local copy. Lifting both into `kernels/mod.rs` is a ~10 line refactor that would remove
-/// the duplication, if the maintainer prefers.
-fn reduce_function(
+/// The discriminator carries the geometry, not just the dtype: two instantiations with the same `T`
+/// but different `LANES` are different kernels, and the source hash would catch it anyway — this
+/// keeps the in-memory interning key honest too.
+pub(crate) fn reduce_function(
     device: &DeviceCuda,
     name: &'static str,
     includes: &[&str],
@@ -212,92 +180,90 @@ fn reduce_function(
     Ok(f)
 }
 
-/// `vecdot` for the `ContigM` shape: one thread per output, serial contraction.
+/// Launch `vecdot` for a plan produced by [`super::reduce_plan::classify_reduce`].
 ///
-/// `las` / `lbs` are the contracted parts, `lam` / `lbm` the remaining parts, both from
-/// `Layout::dim_split_axes`. `lc` is the broadcast-aligned output layout.
+/// `las` / `lbs` are the contracted parts of the operands; their offsets are the base pointers, and
+/// `dim_split_axes` keeps the parent offset on both halves, so one offset serves the whole operand.
+/// All other addressing comes from `plan`, so no geometry is derived twice.
 ///
-/// Returns `UnImplemented` for any shape this slice does not cover — never falls back to the host.
+/// Refusals live in `classify_reduce`, not here: by the time a plan exists the launch is possible.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn vecdot_contig_m_launch<T>(
+pub(crate) fn vecdot_launch<T>(
     device: &DeviceCuda,
     c: &mut CudaBuffer<MaybeUninit<T>>,
     lc: &Layout<IxD>,
     a: &CudaBuffer<T>,
     las: &Layout<IxD>,
-    lam: &Layout<IxD>,
     b: &CudaBuffer<T>,
     lbs: &Layout<IxD>,
-    lbm: &Layout<IxD>,
+    plan: &ReducePlan,
 ) -> Result<()>
 where
-    T: CudaDType + RnOps,
+    T: CudaDType,
 {
-    // --- preconditions of this slice -------------------------------------------------------------
-    if las.ndim() != 1 || lbs.ndim() != 1 {
-        rstsr_raise!(UnImplemented, "cuda vecdot (contig_m, single axis): only one contracted axis is implemented")?;
-    }
-    if lam.ndim() != 1 || lbm.ndim() != 1 {
-        rstsr_raise!(UnImplemented, "cuda vecdot (contig_m, single axis): only one output axis is implemented")?;
-    }
-    // output must be fully contiguous, so that `c[j]` addresses it
-    if lc.ndim() != 1 || lc.stride()[0] != 1 {
-        rstsr_raise!(UnImplemented, "cuda vecdot (contig_m, single axis): output must be contiguous")?;
-    }
-    // the output axis must be unit-stride in both operands -- this is what makes the read coalesced
-    if lam.stride()[0] != 1 || lbm.stride()[0] != 1 {
-        rstsr_raise!(UnImplemented, "cuda vecdot (contig_m, single axis): output axis must be unit-stride in both operands")?;
-    }
-    if las.shape()[0] != lbs.shape()[0] {
-        rstsr_raise!(InvalidLayout, "contracted dimensions of a and b differ")?;
-    }
+    let ReducePlan {
+        lanes,
+        outputs_per_block,
+        block,
+        n_contract,
+        step_a,
+        step_b,
+        n_out,
+        out_step_a,
+        out_step_b,
+    } = *plan;
 
-    let n_out: usize = lc.size();
-    let n_contract: usize = las.shape()[0];
     if n_out == 0 || n_contract == 0 {
         return Ok(());
     }
 
-    // strides are `isize`; widen to i64 for the kernel so negative strides stay exact
-    let sa: i64 = las.stride()[0] as i64;
-    let sb: i64 = lbs.stride()[0] as i64;
-    let sa_out: i64 = lam.stride()[0] as i64;
-    let sb_out: i64 = lbm.stride()[0] as i64;
+    let opb = outputs_per_block as usize;
+    let grid_blocks = (n_out + opb - 1) / opb;
+    // one block per output tile: the grid is a u32 in the driver API
+    if grid_blocks > u32::MAX as usize {
+        rstsr_raise!(UnImplemented, "cuda vecdot: grid exceeds u32")?;
+    }
+    if !lanes.is_power_of_two() || block % lanes != 0 {
+        // A malformed plan is a bug in `classify_reduce`, not a user error; say so loudly.
+        rstsr_raise!(InvalidLayout, "cuda vecdot: plan has lanes={lanes}, block={block}")?;
+    }
 
-    // --- launch ----------------------------------------------------------------------------------
     let exec = device.stream();
     let _ga = crate::kernel::order_input(a, exec)?;
     let _gb = crate::kernel::order_input(b, exec)?;
 
-    // The specialization discriminator carries the arithmetic, not just the dtype name: two
-    // instantiations with the same C type but different intrinsics must not share a cache entry.
-    let disc = format!("{}|{}|{}", T::CNAME, <T as RnOps>::ADD, <T as RnOps>::MUL);
-    let f = reduce_function(device, "rstsr_vecdot_cm", T::INCLUDES, &disc, || {
+    let disc = format!("{}|L{lanes}|B{block}", T::CNAME);
+    let f = reduce_function(device, "rstsr_vecdot", T::INCLUDES, &disc, || {
         render(
-            VECDOT_CM_ENTRY,
+            VECDOT_ENTRY,
             &[
                 ("@T@", T::CNAME),
-                ("@ADD@", <T as RnOps>::ADD),
-                ("@MUL@", <T as RnOps>::MUL),
+                ("@LANES@", &lanes.to_string()),
+                ("@LOG2_LANES@", &lanes.trailing_zeros().to_string()),
+                ("@OPB@", &outputs_per_block.to_string()),
+                ("@MAXW@", &MAX_WARPS_PER_BLOCK.to_string()),
             ],
         )
     })?;
 
     // SAFETY: `MaybeUninit<T>` and `T` are layout-identical; the kernel writes every visited element
-    // (exactly one per `j < n_out`), and `c` holds `n_out` elements.
+    // (exactly once per `j < n_out`, by the lane-0 or tile-leader thread) and `c` holds `n_out`.
     let c_typed: &mut CudaBuffer<T> =
         unsafe { &mut *(c as *mut CudaBuffer<MaybeUninit<T>> as *mut CudaBuffer<T>) };
 
-    crate::kernel::FlatLaunch::new(exec, &f, n_out)
+    crate::kernel::FlatLaunch::new(exec, &f, grid_blocks)
         .arg_u64(offset_ptr(exec, c_typed, lc.offset()))
         .arg_u64(offset_ptr(exec, a, las.offset()))
         .arg_u64(offset_ptr(exec, b, lbs.offset()))
         .arg_usize(n_out)
         .arg_usize(n_contract)
-        .arg_bytes(&sa.to_ne_bytes())
-        .arg_bytes(&sb.to_ne_bytes())
-        .arg_bytes(&sa_out.to_ne_bytes())
-        .arg_bytes(&sb_out.to_ne_bytes())
+        .arg_bytes(&step_a.to_ne_bytes())
+        .arg_bytes(&step_b.to_ne_bytes())
+        .arg_bytes(&out_step_a.to_ne_bytes())
+        .arg_bytes(&out_step_b.to_ne_bytes())
+        // The default flat geometry would launch `n / block` blocks, which is not
+        // `ceil(n_out / outputs_per_block)`. Both dimensions are passed separately.
+        .explicit_shape((grid_blocks as u32, 1, 1), (block, 1, 1))
         .launch()?;
 
     // publish the write to the output buffer's allocation stream
@@ -305,110 +271,62 @@ where
     Ok(())
 }
 
-pub(crate) fn vecdot_contig_s_launch<T>(
-    device: &DeviceCuda,
-    c: &mut CudaBuffer<MaybeUninit<T>>,
-    lc: &Layout<IxD>,
-    a: &CudaBuffer<T>,
-    las: &Layout<IxD>,
-    lam: &Layout<IxD>,
-    b: &CudaBuffer<T>,
-    lbs: &Layout<IxD>,
-    lbm: &Layout<IxD>,
-) -> Result<()>
-where
-    T: CudaDType + RnOps,
-{
-    if las.ndim() != 1 || lbs.ndim() != 1 {
-        rstsr_raise!(UnImplemented, "cuda vecdot (contig_s): only one contracted axis is implemented")?;
-    }
-    if lam.ndim() != 1 || lbm.ndim() != 1 {
-        rstsr_raise!(UnImplemented, "cuda vecdot (contig_s): only one output axis is implemented")?;
-    }
-    if lc.ndim() != 1 || lc.stride()[0] != 1 {
-        rstsr_raise!(UnImplemented, "cuda vecdot (contig_s): output must be contiguous")?;
-    }
-    // this slice is the single-run case only
-    let n_rest = las.shape()[0];
-    if n_rest == 0 || las.shape() != lbs.shape() {
-        rstsr_raise!(InvalidLayout, "contracted dimensions of a and b differ")?;
-    }
-    if las.stride()[0] != 1 || lbs.stride()[0] != 1 {
-        rstsr_raise!(UnImplemented, "cuda vecdot (contig_s): contracted axis must be unit-stride")?;
-    }
-
-    let n_out: usize = lc.size();
-    let n_contract: usize = las.shape()[0];
-    if n_out == 0 || n_contract == 0 {
-        return Ok(());
-    }
-
-    let sa: i64 = las.stride()[0] as i64;
-    let sb: i64 = lbs.stride()[0] as i64;
-    let sa_out: i64 = lam.stride()[0] as i64;
-    let sb_out: i64 = lbm.stride()[0] as i64;
-
-    let exec = device.stream();
-    let _ga = crate::kernel::order_input(a, exec)?;
-    let _gb = crate::kernel::order_input(b, exec)?;
-
-    let f = reduce_function(device, "rstsr_vecdot_cs", T::INCLUDES, T::CNAME, || {
-        render(
-            VECDOT_CS_ENTRY,
-            &[
-                ("@T@", T::CNAME),
-                ("@ADD@", <T as RnOps>::ADD),
-                ("@MUL@", <T as RnOps>::MUL),
-            ],
-        )
-    })?;
-
-    // SAFETY: `MaybeUninit<T>` and `T` are layout-identical; the kernel writes exactly one element
-    // per `j < n_out`, and `c` holds `n_out` elements.
-    let c_typed: &mut CudaBuffer<T> =
-        unsafe { &mut *(c as *mut CudaBuffer<MaybeUninit<T>> as *mut CudaBuffer<T>) };
-
-    crate::kernel::FlatLaunch::new(exec, &f, n_out)
-        .arg_u64(offset_ptr(exec, c_typed, lc.offset()))
-        .arg_u64(offset_ptr(exec, a, las.offset()))
-        .arg_u64(offset_ptr(exec, b, lbs.offset()))
-        .arg_usize(n_out)
-        .arg_usize(n_contract)
-        .arg_bytes(&sa.to_ne_bytes())
-        .arg_bytes(&sb.to_ne_bytes())
-        .arg_bytes(&sa_out.to_ne_bytes())
-        .arg_bytes(&sb_out.to_ne_bytes())
-        .launch()?;
-
-    let _go = crate::kernel::order_output(c, exec)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::reduce_plan::{classify_reduce, MAX_LANES};
     use super::*;
 
-    /// Build a 2-D layout. **Adjust here if the local constructor differs** — this is the only place
-    /// the offset type is written. `Layout::offset()` is read back as `i64` everywhere below, so the
-    /// arithmetic is unaffected by whether it is stored as `usize` or `isize`.
-    fn layout2(shape: [usize; 2], stride: [isize; 2], offset: usize) -> Layout<IxD> {
-        Layout::<IxD>::new(vec![shape[0], shape[1]], vec![stride[0], stride[1]], offset).unwrap()
+    fn layout(shape: &[usize], stride: &[isize], offset: usize) -> Layout<IxD> {
+        // `Layout::new` takes `offset: usize`; keep this helper's signature matching it.
+        Layout::<IxD>::new(shape.to_vec().into(), stride.to_vec().into(), offset).unwrap()
+    }
+
+    /// Mirror of the kernel's `lane` / `j` split, in host arithmetic.
+    ///
+    /// `tid >> log2(lanes)` and `tid & (lanes - 1)` are only equivalent to `/` and `%` because
+    /// `lanes` is a power of two; this checks the two against each other, and checks that every
+    /// output is visited exactly `lanes` times — which is what makes the single lane-0 write safe.
+    #[test]
+    fn thread_split_matches_block_geometry() {
+        for lanes in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let opb = BLOCK / lanes;
+            let log2 = lanes.trailing_zeros();
+            for n_out in [1usize, 7, 64, 999, 4096] {
+                let grid = (n_out + opb - 1) / opb;
+
+                let mut hits = vec![0usize; n_out];
+                for blk in 0..grid {
+                    for tid in 0..BLOCK {
+                        let lane = tid & (lanes - 1);
+                        let j = blk * opb + (tid >> log2);
+                        assert_eq!(lane, tid % lanes, "shift and modulo must agree");
+                        assert!(lane < lanes);
+                        if j < n_out {
+                            hits[j] += 1;
+                        }
+                    }
+                }
+
+                for (j, &h) in hits.iter().enumerate() {
+                    assert_eq!(h, lanes, "lanes={lanes} n_out={n_out}: output {j} hit {h} times");
+                }
+            }
+        }
     }
 
     /// The kernel addresses output `j` at `c_base + j`, and reads `a` at
-    /// `a_base + j * sa_out + m * sa`. `offset_ptr` folds `layout.offset()` into the base pointer,
-    /// so this arithmetic must equal `layout.index_uncheck(&[m, j])` for every element.
+    /// `a_base + j * out_step + m * step`. `offset_ptr` folds `layout.offset()` into the base
+    /// pointer, so this must equal `layout.index_uncheck` for every element.
     ///
-    /// The failure mode this guards is wrong data, not a crash — hence the exhaustive loop rather
-    /// than a couple of spot checks.
+    /// The failure mode guarded here is wrong data, not a crash — hence the exhaustive loop.
     fn check_addresses(la: &Layout<IxD>, n_contract: usize, n_out: usize) {
         let offset: i64 = la.offset() as i64;
-        let sa: i64 = la.stride()[0] as i64; // contracted axis
-        let sa_out: i64 = la.stride()[1] as i64; // output axis
+        let step: i64 = la.stride()[0] as i64; // contracted axis
+        let out_step: i64 = la.stride()[1] as i64; // output axis
 
         for m in 0..n_contract {
             for j in 0..n_out {
-                let derived: i64 = offset + (j as i64) * sa_out + (m as i64) * sa;
+                let derived: i64 = offset + (j as i64) * out_step + (m as i64) * step;
                 let truth: i64 = la.index_uncheck(&[m, j]) as i64;
                 assert_eq!(derived, truth, "address mismatch at (m={m}, j={j})");
             }
@@ -419,32 +337,43 @@ mod tests {
     fn addresses_match_layout_index() {
         // (i, p) layout: contracted axis 0 with stride p, output axis 1 with stride 1
         let (n_i, n_p) = (37usize, 11usize);
-        let la = layout2([n_i, n_p], [n_p as isize, 1], 0);
-        check_addresses(&la, n_i, n_p);
+        check_addresses(&layout(&[n_i, n_p], &[n_p as isize, 1], 0), n_i, n_p);
+    }
+
+    #[test]
+    fn addresses_match_for_the_contiguous_contraction() {
+        // (p, i) layout: the other orientation, contracted axis unit-stride
+        let (n_p, n_i) = (11usize, 37usize);
+        check_addresses(&layout(&[n_p, n_i], &[n_i as isize, 1], 0), n_i, n_p);
     }
 
     #[test]
     fn addresses_match_with_offset() {
         // non-zero offset: this is where the "double count offset" bug lives
         let (n_i, n_p) = (9usize, 5usize);
-        let la = layout2([n_i, n_p], [n_p as isize, 1], 3);
-        check_addresses(&la, n_i, n_p);
+        check_addresses(&layout(&[n_i, n_p], &[n_p as isize, 1], 3), n_i, n_p);
     }
 
+    /// The plan is the launcher's only source of geometry, so anything the classifier emits must be
+    /// launchable. Cheap sweep rather than a second derivation.
     #[test]
-    fn addresses_match_for_strided_contract() {
-        // contracted axis every other row: stride 2 * n_p
-        let (n_i, n_p) = (6usize, 4usize);
-        let la = layout2([n_i, n_p], [2 * n_p as isize, 1], 0);
-        check_addresses(&la, n_i, n_p);
-    }
-
-    #[test]
-    fn addresses_match_for_strided_output() {
-        // output axis with stride 2 -- admissible via the launcher's stride arguments even though
-        // the classifier would reject it as non-contiguous; this checks the arithmetic, not the policy
-        let (n_i, n_p) = (5usize, 7usize);
-        let la = layout2([n_i, n_p], [2 * n_p as isize, 2], 0);
-        check_addresses(&la, n_i, n_p);
+    fn every_plan_the_classifier_emits_is_launchable() {
+        for n_contract in [1usize, 3, 8, 1023, 4096, 100_000] {
+            for n_out in [1usize, 8, 1000, 200_000] {
+                for contract_last in [true, false] {
+                    let shape = if contract_last { [n_out, n_contract] } else { [n_contract, n_out] };
+                    let la = layout(&shape, &[shape[1] as isize, 1], 0);
+                    let lc = layout(&[n_out], &[1], 0);
+                    let axis = if contract_last { 1isize } else { 0isize };
+                    let plan = classify_reduce(&la, &la, &lc, &[axis], &[axis], RowMajor).unwrap_or_else(|e| {
+                        panic!("({n_contract}, {n_out}, last={contract_last}) should be plannable: {e}")
+                    });
+                    assert!(plan.lanes.is_power_of_two() && plan.lanes <= MAX_LANES);
+                    assert_eq!(plan.block, BLOCK as u32);
+                    assert_eq!(plan.block % plan.lanes, 0, "the launcher would reject this plan");
+                    assert_eq!(plan.lanes * plan.outputs_per_block, plan.block);
+                }
+            }
+        }
     }
 }

@@ -842,13 +842,13 @@ where
 }
 
 use crate::kernels::reduce;
-use crate::kernels::reduce_plan::{classify_reduce, ReducePlan};
+use crate::kernels::reduce_plan::classify_reduce;
 
 impl<T, D> DeviceVecdotAPI<T, T, T, D, D, D> for DeviceCuda
 where
     Self: DeviceRawAPI<T, Raw = CudaBuffer<T>>
         + DeviceRawAPI<MaybeUninit<T>, Raw = CudaBuffer<MaybeUninit<T>>>,
-    T: CudaDType + reduce::RnOps,
+    T: CudaDType,
     D: DimAPI,
 {
     fn vecdot(
@@ -866,39 +866,21 @@ where
         // the CPU path receives from its caller.
         let order: FlagOrder = self.default_order();
 
-        // Work on dynamic layouts: the split destroys static rank knowledge, and the classifier
-        // must see exactly the `Layout<IxD>` the CPU code sees so the port stays faithful.
+        // Work on dynamic layouts: the split destroys static rank knowledge, and the classifier must
+        // see exactly the `Layout<IxD>` the CPU code sees so the port stays faithful.
         let la_d = la.to_dim::<IxD>()?;
         let lb_d = lb.to_dim::<IxD>()?;
         let lc_d = lc.to_dim::<IxD>()?;
 
         let plan = classify_reduce(&la_d, &lb_d, &lc_d, axes_a, axes_b, order)?;
 
-        match plan {
-            // One thread per output element, serial contraction, no cross-thread reduction.
-            ReducePlan::ContigM { .. } => {
-                let (las, lam) = la_d.dim_split_axes(axes_a)?;
-                let (lbs, lbm) = lb_d.dim_split_axes(axes_b)?;
-                // broadcast-align the output against the remaining axes, exactly as the planner did
-                let (lc_aligned, lam) = broadcast_layout_to_first(&lc_d, &lam, order)?;
-                let (lc_aligned, lbm) = broadcast_layout_to_first(&lc_aligned, &lbm, order)?;
+        // The plan already carries the strides, so the launcher needs the split layouts only for
+        // their base offsets. No broadcast-alignment here: the classifier aligns its own copy and
+        // the output's offset does not move under it.
+        let (las, _) = la_d.dim_split_axes(axes_a)?;
+        let (lbs, _) = lb_d.dim_split_axes(axes_b)?;
 
-                reduce::vecdot_contig_m_launch(self, c, &lc_aligned, a, &las, &lam, b, &lbs, &lbm)
-            },
-
-            ReducePlan::ContigS { .. } => {
-                let (las, lam) = la_d.dim_split_axes(axes_a)?;
-                let (lbs, lbm) = lb_d.dim_split_axes(axes_b)?;
-
-                let (lc_aligned, lam) = broadcast_layout_to_first(&lc_d, &lam, order)?;
-                let (lc_aligned, lbm) = broadcast_layout_to_first(&lc_aligned, &lbm, order)?;
-
-                reduce::vecdot_contig_s_launch(self, c, &lc_aligned, a, &las, &lam, b, &lbs, &lbm)
-            },
-            ReducePlan::General => {
-                rstsr_raise!(UnImplemented, "cuda vecdot: general plan (pack-then-reduce) not implemented yet")?
-            },
-        }
+        reduce::vecdot_launch(self, c, &lc_d, a, &las, b, &lbs, &plan)
     }
 }
 
