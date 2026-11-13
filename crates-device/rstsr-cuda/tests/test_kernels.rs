@@ -780,11 +780,23 @@ fn reduce_multi_axis_keepdims_and_whole() {
         rt::asarray((exact_data(24, 11), &dcpu)).into_shape([2, 3, 4]);
     let gpu = cpu.to_device(&d);
 
-    // (0, 2) contracted: the remaining part is the middle axis, so `n_contract` is 8 on both sides
-    let got: Vec<f64> = host_vec1(&gpu.sum_axes([0isize, 2]));
-    let want: Vec<f64> = host_vec1(&cpu.sum_axes([0isize, 2]));
-    assert_eq!(got, want, "sum over (0, 2)");
-    assert_eq!(got.len(), 3, "shape [2, 3, 4] reduced over (0, 2) leaves 3 elements");
+    // (1, 2) contracted: those axes are one contiguous 12-element block per output
+    let got: Vec<f64> = host_vec1(&gpu.sum_axes([1isize, 2]));
+    let want: Vec<f64> = host_vec1(&cpu.sum_axes([1isize, 2]));
+    assert_eq!(got, want, "sum over (1, 2)");
+    assert_eq!(got.len(), 2, "shape [2, 3, 4] reduced over (1, 2) leaves 2 elements");
+
+    // (0, 2) contracted is NOT one block: the two runs of 4 sit 8 elements apart, because the
+    // middle axis belongs to the output. The kernel walks one arithmetic progression, so this is
+    // refused rather than mis-computed. Widening it needs a multi-run walk (or pack-then-reduce);
+    // the refusal is asserted so it cannot regress silently into a wrong answer.
+    match rt::sum_axes_f(&gpu, [0isize, 2]) {
+        Ok(_) => panic!("a non-contiguous contraction should be refused, not computed"),
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(msg.contains("not one contiguous block"), "got: {msg}");
+        },
+    }
 
     // keepdims is a host-side layout rewrite: the values must be untouched, the shape must not be
     let k = gpu.sum_with_args((-1isize, true));
@@ -797,7 +809,7 @@ fn reduce_multi_axis_keepdims_and_whole() {
     let w = gpu.sum_with_args(());
     let w_cpu = cpu.sum_with_args(());
     assert_eq!(w.shape(), &[] as &[usize], "axes = None gives a 0-D tensor");
-    assert_eq!(host_vec1(&w), host_vec1(&w_cpu), "axes = None values");
+    assert_eq!(w.to_scalar(), w_cpu.to_scalar(), "axes = None values");
 }
 
 /// A view with a non-zero `layout.offset()`: the launcher folds the split layout's offset into the
@@ -865,12 +877,20 @@ fn reduce_min_max_nan_and_signed_zero() {
     assert!(g.min().is_nan(), "min must propagate NaN, like ExtReal::ext_min");
     assert!(g.max().is_nan(), "max must propagate NaN");
 
-    // -0.0 vs +0.0: IEEE minimum keeps the negative zero, and so must the device, in either order
+    // ±0. The device must be order-INDEPENDENT here; the CPU is not. `ExtReal::ext_min` calls
+    // `T::min`, i.e. LLVM's `minnum`, which resolves an exact tie by operand position — so on this
+    // machine the CPU answers +0.0 for min(-0.0, +0.0) and -0.0 for min(+0.0, -0.0). A commutative
+    // tree cannot reproduce an order-dependent tie-break, and should not: IEEE 754-2019
+    // `minimum`/`maximum` (which `ExtReal`'s own doc says it wants) fixes the sign regardless of
+    // order, and that is what `fmin`/`fmax` give. The two are numerically equal either way, so the
+    // assertion is on the sign being stable, plus plain `==` against the CPU.
     for vals in [vec![-0.0f64, 0.0], vec![0.0f64, -0.0]] {
         let c: Tensor<f64, DeviceCpuSerial, _> = rt::asarray((vals, &dcpu));
         let g = c.to_device(&d);
-        assert_eq!(g.min().to_bits(), c.min().to_bits(), "min(-0.0, +0.0) sign");
-        assert_eq!(g.max().to_bits(), c.max().to_bits(), "max(-0.0, +0.0) sign");
+        assert_eq!(g.min().to_bits(), (-0.0f64).to_bits(), "device min keeps -0, either order");
+        assert_eq!(g.max().to_bits(), 0.0f64.to_bits(), "device max keeps +0, either order");
+        assert_eq!(g.min(), c.min(), "min agrees numerically with the CPU");
+        assert_eq!(g.max(), c.max(), "max agrees numerically with the CPU");
     }
 }
 
@@ -913,9 +933,11 @@ fn reduce_dtype_accumulator() {
     let a: Tensor<f32, _, _> = rt::full(([1_000usize], 0.1f32, &d));
     let a_cpu: Tensor<f32, DeviceCpuSerial, _> = rt::full(([1_000usize], 0.1f32, &dcpu));
 
-    let got = host_vec1(&rt::sum_with_dtype::<f32, f64, _, _>(&a, ()))[0];
-    let want = host_vec1(&rt::sum_with_dtype::<f32, f64, _, _>(&a_cpu, ()))[0];
-    let in_f32 = host_vec1(&rt::sum_with_dtype::<f32, f32, _, _>(&a_cpu, ()))[0];
+    // `axes = ()` gives a 0-D result, and `host_vec1` needs a 1-D tensor (`to_raw_f` asserts it),
+    // so read the single element with `to_scalar` instead.
+    let got: f64 = rt::sum_with_dtype::<f32, f64, _, _>(&a, ()).to_scalar();
+    let want: f64 = rt::sum_with_dtype::<f32, f64, _, _>(&a_cpu, ()).to_scalar();
+    let in_f32: f32 = rt::sum_with_dtype::<f32, f32, _, _>(&a_cpu, ()).to_scalar();
 
     assert_eq!(got, want, "f32 operand accumulated in f64");
     assert_ne!(
