@@ -8,6 +8,9 @@ use rstsr_cuda::prelude_dev::*;
 use std::sync::Arc;
 
 /// D2H of a tensor's visible elements by layout gather (house helper).
+///
+/// **1-D only**: it goes through `to_raw_f`, which asserts `ndim == 1`. Use [`host_nd`] for anything
+/// of higher rank and `to_scalar` for a 0-D result.
 fn host_vec1<T, B, D, R>(t: &TensorAny<R, T, B, D>) -> Vec<T>
 where
     R: DataAPI<Data = <B as DeviceRawAPI<T>>::Raw>,
@@ -803,7 +806,7 @@ fn reduce_multi_axis_keepdims_and_whole() {
     let k_cpu = cpu.sum_with_args((-1isize, true));
     assert_eq!(k.shape(), &[2, 3, 1]);
     assert_eq!(k.shape(), k_cpu.shape());
-    assert_eq!(host_vec1(&k), host_vec1(&k_cpu), "keepdims values");
+    assert_eq!(host_nd(&k), host_nd(&k_cpu), "keepdims values (rank-3, so host_nd)");
 
     // axes = None: 0-D output, built by a D2H + H2D round trip in the tensor tier
     let w = gpu.sum_with_args(());
@@ -940,6 +943,21 @@ fn reduce_dtype_accumulator() {
     let in_f32: f32 = rt::sum_with_dtype::<f32, f32, _, _>(&a_cpu, ()).to_scalar();
 
     assert_eq!(got, want, "f32 operand accumulated in f64");
+
+    // `prod`/`mean` share the kernel and the helpers and differ only by the fold row, but neither
+    // had a direct test. Exact values, so the comparison is bitwise.
+    let small: Tensor<f32, _, _> = rt::full(([4usize], 2.0f32, &d));
+    let small_cpu: Tensor<f32, DeviceCpuSerial, _> = rt::full(([4usize], 2.0f32, &dcpu));
+    assert_eq!(
+        rt::prod_with_dtype::<f32, f64, _, _>(&small, ()).to_scalar(),
+        rt::prod_with_dtype::<f32, f64, _, _>(&small_cpu, ()).to_scalar(),
+        "prod_with_dtype: 2^4"
+    );
+    assert_eq!(
+        rt::mean_with_dtype::<f32, f64, _, _>(&small, ()).to_scalar(),
+        rt::mean_with_dtype::<f32, f64, _, _>(&small_cpu, ()).to_scalar(),
+        "mean_with_dtype"
+    );
     assert_ne!(
         got as f32, in_f32,
         "the test data must actually distinguish an f64 accumulator from an f32 one"
