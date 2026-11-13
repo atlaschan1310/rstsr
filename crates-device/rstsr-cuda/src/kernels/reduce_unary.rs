@@ -474,7 +474,7 @@ mod tests {
     ];
 
     fn layout(shape: &[usize], stride: &[isize], offset: usize) -> Layout<IxD> {
-        Layout::<IxD>::new(shape.to_vec().into(), stride.to_vec().into(), offset).unwrap()
+        Layout::<IxD>::new(shape.to_vec(), stride.to_vec(), offset).unwrap()
     }
 
     /// Every row of the table must be internally consistent, because a mistake here shows up as an

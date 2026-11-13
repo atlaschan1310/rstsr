@@ -37,7 +37,12 @@ where
 
 macro_rules! require_cuda {
     () => {
-        if !funcs::is_available() {
+        // `cudarc` *panics* when the driver library is absent (nothing to dlopen) instead of
+        // reporting zero devices, so `is_available()` is not a probe on a machine without CUDA —
+        // it aborts the test. Treat the panic as "no device" so this file skips on a laptop
+        // instead of failing every GPU test, and still runs normally where a driver is present.
+        let available = std::panic::catch_unwind(funcs::is_available).unwrap_or(false);
+        if !available {
             eprintln!("skipping: no CUDA device visible");
             return;
         }
@@ -479,10 +484,8 @@ fn inplace_after_stream_retag() {
 
 /* #region vecdot */
 
-/* #region vecdot */
-
 /// Deterministic, deliberately non-representable f64 data.
-fn vecdot_probe_data(n: usize, seed: u64) -> Vec<f64> {
+fn probe_data(n: usize, seed: u64) -> Vec<f64> {
     let mut s = seed | 1;
     (0..n)
         .map(|_| {
@@ -495,7 +498,7 @@ fn vecdot_probe_data(n: usize, seed: u64) -> Vec<f64> {
 
 /// Small integers as f64: every product is exact, every sum below 2^53 is exact, so the result is
 /// independent of summation order and may be compared with `assert_eq!`.
-fn vecdot_exact_data(n: usize, seed: u64) -> Vec<f64> {
+fn exact_data(n: usize, seed: u64) -> Vec<f64> {
     let mut s = seed | 1;
     (0..n)
         .map(|_| {
@@ -562,7 +565,7 @@ fn vecdot_case(rows: usize, cols: usize, axis: isize, exact: bool) {
     // Pin the host device: `DeviceCpu` resolves to `DeviceFaer` under `faer_as_default`, whose impls
     // are feature-gated.
     let dcpu = DeviceCpuSerial::default();
-    let gen = if exact { vecdot_exact_data } else { vecdot_probe_data };
+    let gen = if exact { exact_data } else { probe_data };
 
     let seed = (rows as u64) * 1_000_003 + cols as u64;
     let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
@@ -587,7 +590,7 @@ fn vecdot_case(rows: usize, cols: usize, axis: isize, exact: bool) {
 
 /// Every lane count, on data where the summation order cannot matter.
 ///
-/// Named for what it asserts, not for the fixture it uses: `vecdot_exact_data` is the generator
+/// Named for what it asserts, not for the fixture it uses: `exact_data` is the generator
 /// below and a test of the same name would shadow it.
 #[test]
 fn vecdot_all_lane_counts_exact() {
@@ -620,15 +623,15 @@ fn vecdot_offset_view() {
     let (rows, cols) = (100usize, 10_024usize);
 
     let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
-        rt::asarray((vecdot_exact_data(rows * cols, 5), &dcpu)).into_shape([rows, cols]);
+        rt::asarray((exact_data(rows * cols, 5), &dcpu)).into_shape([rows, cols]);
     let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
-        rt::asarray((vecdot_exact_data(rows * cols, 6), &dcpu)).into_shape([rows, cols]);
+        rt::asarray((exact_data(rows * cols, 6), &dcpu)).into_shape([rows, cols]);
 
-    let want: Vec<f64> = host_vec1(&rt::vecdot(&a_cpu.i(3..), &b_cpu.i(3..), 0));
+    let want: Vec<f64> = host_vec1(&rt::vecdot(a_cpu.i(3..), b_cpu.i(3..), 0));
 
     let a = a_cpu.to_device(&d);
     let b = b_cpu.to_device(&d);
-    let got: Vec<f64> = host_vec1(&rt::vecdot(&a.i(3..), &b.i(3..), 0));
+    let got: Vec<f64> = host_vec1(&rt::vecdot(a.i(3..), b.i(3..), 0));
 
     assert_eq!(got, want, "offset view (97 x 10024, axis 0): exact data must agree bitwise");
 }
@@ -643,10 +646,10 @@ fn vecdot_refuses_unplannable_shapes() {
     // Stepped on both axes: neither the contracted nor the output part has a unit-stride run, so
     // there is nothing to coalesce on. Packing is the eventual answer; until then, refuse.
     let r = SliceI::new(None::<isize>, None::<isize>, Some(2isize));
-    let a2: Tensor<f64, _, _> = rt::arange((0., (512. * 512.) as f64, 1., &d)).into_shape([512, 512]);
+    let a2: Tensor<f64, _, _> = rt::arange((0., 512. * 512., 1., &d)).into_shape([512, 512]);
     let b2: Tensor<f64, _, _> =
-        rt::arange((1., (512. * 512.) as f64 + 1., 1., &d)).into_shape([512, 512]);
-    match rt::vecdot_f(&a2.i((r, r)), &b2.i((r, r)), 0) {
+        rt::arange((1., (512. * 512.) + 1., 1., &d)).into_shape([512, 512]);
+    match rt::vecdot_f(a2.i((r, r)), b2.i((r, r)), 0) {
         Ok(_) => panic!("stepped-on-both-axes should be refused, but it computed a result"),
         Err(e) => {
             let msg = format!("{e}");
@@ -656,9 +659,9 @@ fn vecdot_refuses_unplannable_shapes() {
 
     // Rank-3 contracted on the last axis: the output part is two axes, which one `out_step` cannot
     // describe. This is missing capability, not a layout defect, and it is reported as such.
-    let a3: Tensor<f64, _, _> = rt::arange((0., (4. * 8. * 8.) as f64, 1., &d)).into_shape([4, 8, 8]);
+    let a3: Tensor<f64, _, _> = rt::arange((0., 4. * 8. * 8., 1., &d)).into_shape([4, 8, 8]);
     let b3: Tensor<f64, _, _> =
-        rt::arange((1., (4. * 8. * 8.) as f64 + 1., 1., &d)).into_shape([4, 8, 8]);
+        rt::arange((1., (4. * 8. * 8.) + 1., 1., &d)).into_shape([4, 8, 8]);
     match rt::vecdot_f(&a3, &b3, 2) {
         Ok(_) => panic!("multi-axis output should be refused, but it computed a result"),
         Err(e) => {
@@ -668,5 +671,257 @@ fn vecdot_refuses_unplannable_shapes() {
     }
 }
 
+
+/* #endregion */
+
+/* #region unary reductions */
+
+/// The shapes the reduce kernels are exercised on, `(rows, cols, contracted axis)`.
+///
+/// Deliberately the same nine as `VECDOT_CASES`: the plan comes from the same classifier, so these
+/// are the shapes that compile the 1/2/4/8/16/32/64/128/256-lane variants. Only `sum` walks all of
+/// them — the tree and the addressing are shared across ops, so a per-op fold is checked on small
+/// tensors instead of nine shapes each.
+const REDUCE_CASES: &[(usize, usize, isize)] = &[
+    (2, 131_072, 0),  // lanes 1   — thread per output, no tree at all
+    (8, 100_000, 0),  // lanes 2   — 16 outputs per warp
+    (20_000, 3, 1),   // lanes 4   — 8 outputs per warp
+    (20_000, 8, 1),   // lanes 8   — 4 outputs per warp
+    (100, 10_024, 0), // lanes 16  — strided contraction, step_a = 10024
+    (20_000, 32, 1),  // lanes 32  — exactly one warp per output
+    (3_000, 64, 1),   // lanes 64  — 2 warps per output, shared-memory stage
+    (1_500, 128, 1),  // lanes 128 — 4 warps per output
+    (500, 1_024, 1),  // lanes 256 — whole block on one output
+];
+
+/// One `(rows, cols)` pair of tensors on both devices, integer-valued so summation order cannot
+/// matter, plus the probe-data twin for the ops where it can.
+fn reduce_pair(rows: usize, cols: usize, seed: u64) -> (Tensor<f64, DeviceCuda, IxD>, Tensor<f64, DeviceCpuSerial, IxD>) {
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(rows * cols, seed), &dcpu)).into_shape([rows, cols]);
+    let gpu = cpu.to_device(&d);
+    (gpu, cpu)
+}
+
+/// `sum` over the contracted axis, one shape per lane count.
+///
+/// Every failure mode of the tree shows up here: a wrong `lane` mask sends another output's partial
+/// sum into this one (values, not just a crash), a missing shared-memory stage truncates the result
+/// for lanes > 32, and a wrong `step` reads the wrong element. Exact data makes the comparison an
+/// `assert_eq!` rather than a tolerance, so a single flipped bit fails the test.
+#[test]
+fn reduce_sum_over_all_lane_counts() {
+    require_cuda!();
+    for &(rows, cols, axis) in REDUCE_CASES {
+        let (gpu, cpu) = reduce_pair(rows, cols, rows as u64 * 1_000_003 + cols as u64);
+        let got: Vec<f64> = host_vec1(&gpu.sum_axes(axis));
+        let want: Vec<f64> = host_vec1(&cpu.sum_axes(axis));
+        assert_eq!(got, want, "sum over axis {axis} of ({rows} x {cols})");
+    }
+}
+
+/// The folds that are not a sum: `min`, `max` (order-blind) and `mean`, `l2_norm` (order-dependent).
+#[test]
+fn reduce_families_vs_cpu() {
+    require_cuda!();
+    for &(rows, cols, axis) in &[(7usize, 5usize, 0isize), (7, 5, 1), (3, 64, 1), (1_000, 33, 0)] {
+        let (gpu, cpu) = reduce_pair(rows, cols, rows as u64 * 31 + cols as u64);
+        let ctx = format!("({rows} x {cols}, axis {axis})");
+
+        // Integer-valued input: min/max/sum agree bitwise whatever the visiting order.
+        assert_eq!(host_vec1(&gpu.min_axes(axis)), host_vec1(&cpu.min_axes(axis)), "min {ctx}");
+        assert_eq!(host_vec1(&gpu.max_axes(axis)), host_vec1(&cpu.max_axes(axis)), "max {ctx}");
+        assert_eq!(host_vec1(&gpu.sum_axes(axis)), host_vec1(&cpu.sum_axes(axis)), "sum {ctx}");
+
+        // Division and the square root do not survive reordering bit-for-bit.
+        assert_close(&host_vec1(&gpu.mean_axes(axis)), &host_vec1(&cpu.mean_axes(axis)), &format!("mean {ctx}"));
+        assert_close(&host_vec1(&gpu.l2_norm_axes(axis)), &host_vec1(&cpu.l2_norm_axes(axis)), &format!("l2 {ctx}"));
+
+        // The whole-array forms, which take the `to_cpu_vec` path in the device impl.
+        assert_eq!(gpu.min(), cpu.min(), "min_all {ctx}");
+        assert_eq!(gpu.max(), cpu.max(), "max_all {ctx}");
+        assert_eq!(gpu.sum(), cpu.sum(), "sum_all {ctx}");
+        assert!((gpu.mean() - cpu.mean()).abs() < 1e-12, "mean_all {ctx}");
+        assert!((gpu.l2_norm() - cpu.l2_norm()).abs() < 1e-12, "l2_norm_all {ctx}");
+    }
+}
+
+/// `prod` is its own case: a long contraction of values in [-4, 4] overflows and stops being exact.
+///
+/// Values are restricted to {-2, -1, 0, 1, 2} over eight elements, so every partial product is
+/// representable and the comparison stays bitwise.
+#[test]
+fn reduce_prod_vs_cpu() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let vals: Vec<f64> = (0..48).map(|k| [-2.0, -1.0, 0.0, 1.0, 2.0][(k * 7 + k / 5) % 5]).collect();
+
+    let cpu: Tensor<f64, DeviceCpuSerial, _> = rt::asarray((vals, &dcpu)).into_shape([6, 8]);
+    let gpu = cpu.to_device(&d);
+
+    assert_eq!(host_vec1(&gpu.prod_axes(1)), host_vec1(&cpu.prod_axes(1)), "prod over axis 1");
+    assert_eq!(host_vec1(&gpu.prod_axes(0)), host_vec1(&cpu.prod_axes(0)), "prod over axis 0");
+    assert_eq!(gpu.prod(), cpu.prod(), "prod_all");
+}
+
+/// Three shapes `_axes` does not cover: several contracted axes, `keepdims`, and `axes = None`.
+///
+/// The last one is the interesting one structurally — it leaves the device through `sum_all` and
+/// comes back through `outof_cpu_vec`, so a mistake in either transfer shows up only here.
+#[test]
+fn reduce_multi_axis_keepdims_and_whole() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(24, 11), &dcpu)).into_shape([2, 3, 4]);
+    let gpu = cpu.to_device(&d);
+
+    // (0, 2) contracted: the remaining part is the middle axis, so `n_contract` is 8 on both sides
+    let got: Vec<f64> = host_vec1(&gpu.sum_axes([0isize, 2]));
+    let want: Vec<f64> = host_vec1(&cpu.sum_axes([0isize, 2]));
+    assert_eq!(got, want, "sum over (0, 2)");
+    assert_eq!(got.len(), 3, "shape [2, 3, 4] reduced over (0, 2) leaves 3 elements");
+
+    // keepdims is a host-side layout rewrite: the values must be untouched, the shape must not be
+    let k = gpu.sum_with_args((-1isize, true));
+    let k_cpu = cpu.sum_with_args((-1isize, true));
+    assert_eq!(k.shape(), &[2, 3, 1]);
+    assert_eq!(k.shape(), k_cpu.shape());
+    assert_eq!(host_vec1(&k), host_vec1(&k_cpu), "keepdims values");
+
+    // axes = None: 0-D output, built by a D2H + H2D round trip in the tensor tier
+    let w = gpu.sum_with_args(());
+    let w_cpu = cpu.sum_with_args(());
+    assert_eq!(w.shape(), &[] as &[usize], "axes = None gives a 0-D tensor");
+    assert_eq!(host_vec1(&w), host_vec1(&w_cpu), "axes = None values");
+}
+
+/// A view with a non-zero `layout.offset()`: the launcher folds the split layout's offset into the
+/// base pointer, so a doubled or dropped offset shifts every result by a constant.
+#[test]
+fn reduce_offset_view() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(100 * 40, 5), &dcpu)).into_shape([100, 40]);
+    let gpu = cpu.to_device(&d);
+
+    for axis in [0isize, 1] {
+        let got: Vec<f64> = host_vec1(&gpu.i(3..).sum_axes(axis));
+        let want: Vec<f64> = host_vec1(&cpu.i(3..).sum_axes(axis));
+        assert_eq!(got, want, "offset view (97 x 40), axis {axis}");
+    }
+}
+
+/// The four traits whose output is not the operand type: `all`, `any`, `count_nonzero`, and `sum`
+/// over `bool` (which is `TensorSumBoolAPI`, not `OpSumAPI`).
+#[test]
+fn reduce_bool_family() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let a: Tensor<f64, _, _> = rt::arange((0., 32., 1., &d)).into_shape([4, 8]);
+    let b = rt::lt(&a, 20.0);
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::arange((0., 32., 1., &dcpu)).into_shape([4, 8]);
+    let b_cpu = rt::lt(&a_cpu, 20.0);
+
+    // whole-array forms: bool in, bool out; bool in, usize out
+    assert_eq!(b.all(), b_cpu.all(), "all");
+    assert_eq!(b.any(), b_cpu.any(), "any");
+    assert_eq!(b.sum(), b_cpu.sum(), "sum over bool (TensorSumBoolAPI)");
+
+    // axes form: the `usize` output travels through `@TOUT@` and the store cast
+    let got: Vec<usize> = host_vec1(&b.sum_axes(0));
+    let want: Vec<usize> = host_vec1(&b_cpu.sum_axes(0));
+    assert_eq!(got, want, "sum over bool, axis 0");
+    assert_eq!(got.len(), 8);
+    assert_eq!(got.iter().sum::<usize>(), b.sum() as usize, "the axis form must partition the total");
+
+    // count_nonzero on a numeric tensor, where the fold's predicate is `x != 0`
+    let z: Tensor<f64, _, _> = rt::full(([5usize], 0.0f64, &d));
+    assert_eq!(z.count_nonzero(), 0);
+    let m: Tensor<f64, _, _> = rt::asarray((vec![0.0f64, 1.0, 0.0, -2.0, 0.0], &d));
+    assert_eq!(m.count_nonzero(), 2);
+}
+
+/// `min`/`max` are the only rows whose identity is an infinity, and the only rows where the CPU and
+/// CUDA defaults disagree: `ExtReal::ext_min` propagates NaN (IEEE 754-2019 `minimum`), while CUDA's
+/// `fmin` returns the non-NaN operand. These two cases are what the `RSTSR_MIN` guard exists for.
+#[test]
+fn reduce_min_max_nan_and_signed_zero() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+
+    let with_nan: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((vec![1.0f64, f64::NAN, -2.0, 3.0], &dcpu));
+    let g = with_nan.to_device(&d);
+    assert!(with_nan.min().is_nan(), "CPU reference: NaN propagates");
+    assert!(g.min().is_nan(), "min must propagate NaN, like ExtReal::ext_min");
+    assert!(g.max().is_nan(), "max must propagate NaN");
+
+    // -0.0 vs +0.0: IEEE minimum keeps the negative zero, and so must the device, in either order
+    for vals in [vec![-0.0f64, 0.0], vec![0.0f64, -0.0]] {
+        let c: Tensor<f64, DeviceCpuSerial, _> = rt::asarray((vals, &dcpu));
+        let g = c.to_device(&d);
+        assert_eq!(g.min().to_bits(), c.min().to_bits(), "min(-0.0, +0.0) sign");
+        assert_eq!(g.max().to_bits(), c.max().to_bits(), "max(-0.0, +0.0) sign");
+    }
+}
+
+/// Empty input: the launcher returns without writing, so the caller must have filled the output with
+/// the identity. `sum([]) == 0` reading uninitialised device memory that happens to look like zero is
+/// exactly the bug this catches.
+#[test]
+fn reduce_empty_identities() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let e: Tensor<f64, _, _> = rt::zeros(([0usize, 3], &d));
+
+    assert_eq!(e.sum(), 0.0, "sum of an empty tensor is the additive identity");
+    assert_eq!(e.prod(), 1.0, "prod of an empty tensor is the multiplicative identity");
+    assert_eq!(e.l2_norm(), 0.0);
+    assert!(e.mean().is_nan(), "an empty mean is 0/0, as on the CPU");
+    assert_eq!(e.count_nonzero(), 0);
+
+    // min/max have no identity: the CPU raises, and so must we
+    match rt::min_f(&e) {
+        Ok(v) => panic!("min of an empty tensor should raise, got {v}"),
+        Err(e) => assert!(format!("{e}").contains("zero-size"), "got: {e}"),
+    }
+    match rt::max_f(&e) {
+        Ok(v) => panic!("max of an empty tensor should raise, got {v}"),
+        Err(e) => assert!(format!("{e}").contains("zero-size"), "got: {e}"),
+    }
+}
+
+/// The explicit-output-dtype path: `f32` operand accumulated in `f64`.
+///
+/// `0.1f32` is exact in `f64`, so summing 1000 of them in `f64` is exact while summing them in `f32`
+/// is not — which is what makes this a test of `@TACC@` and not just of the kernel running.
+#[test]
+fn reduce_dtype_accumulator() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+
+    let a: Tensor<f32, _, _> = rt::full(([1_000usize], 0.1f32, &d));
+    let a_cpu: Tensor<f32, DeviceCpuSerial, _> = rt::full(([1_000usize], 0.1f32, &dcpu));
+
+    let got = host_vec1(&rt::sum_with_dtype::<f32, f64, _, _>(&a, ()))[0];
+    let want = host_vec1(&rt::sum_with_dtype::<f32, f64, _, _>(&a_cpu, ()))[0];
+    let in_f32 = host_vec1(&rt::sum_with_dtype::<f32, f32, _, _>(&a_cpu, ()))[0];
+
+    assert_eq!(got, want, "f32 operand accumulated in f64");
+    assert_ne!(
+        got as f32, in_f32,
+        "the test data must actually distinguish an f64 accumulator from an f32 one"
+    );
+}
 
 /* #endregion */

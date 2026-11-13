@@ -278,7 +278,7 @@ mod tests {
 
     fn layout(shape: &[usize], stride: &[isize], offset: usize) -> Layout<IxD> {
         // `Layout::new` takes `offset: usize`; keep this helper's signature matching it.
-        Layout::<IxD>::new(shape.to_vec().into(), stride.to_vec().into(), offset).unwrap()
+        Layout::<IxD>::new(shape.to_vec(), stride.to_vec(), offset).unwrap()
     }
 
     /// Mirror of the kernel's `lane` / `j` split, in host arithmetic.
@@ -292,7 +292,7 @@ mod tests {
             let opb = BLOCK / lanes;
             let log2 = lanes.trailing_zeros();
             for n_out in [1usize, 7, 64, 999, 4096] {
-                let grid = (n_out + opb - 1) / opb;
+                let grid = n_out.div_ceil(opb);
 
                 let mut hits = vec![0usize; n_out];
                 for blk in 0..grid {

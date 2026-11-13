@@ -345,7 +345,7 @@ mod tests {
     /// axis's stride clears the block's whole span, holes included — 64 elements laid out as eight
     /// 8-element runs 16 apart span 120 slots, and the axis above them needs stride ≥ 120, not 64.
     fn layout(shape: &[usize], stride: &[isize], offset: usize) -> Layout<IxD> {
-        Layout::<IxD>::new(shape.to_vec().into(), stride.to_vec().into(), offset).unwrap()
+        Layout::<IxD>::new(shape.to_vec(), stride.to_vec(), offset).unwrap()
     }
 
     /// C-order 2-D operand layout plus a contiguous 1-D output layout of `n_out`.
