@@ -45,6 +45,7 @@ pub(crate) mod kernels;
 
 pub(crate) mod kernels_ops;
 pub mod operators;
+pub mod reduce_ops;
 pub mod registry;
 pub mod stream;
 pub mod transfer;

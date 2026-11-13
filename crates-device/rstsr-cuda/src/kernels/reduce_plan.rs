@@ -12,9 +12,7 @@
 //!   and there is no cross-thread combination at all.
 //! - `outputs_per_block` — how many outputs share a block; `lanes * outputs_per_block == block`.
 //!
-//! `lanes > 1` is the old `ContigS` shape and `lanes == 1` is the old `ContigM` shape, but they are
-//! the two ends of one parameterised kernel rather than two kernels, and they are *selected by the
-//! same expression* — there is no branch between them:
+//! They come from one expression, with no branch between the two regimes:
 //!
 //! ```text
 //! lanes = max(free, need).next_power_of_two().min(cap)
@@ -29,46 +27,30 @@
 //! - `cap` — what the contraction can actually fill.
 //!
 //! `need <= free` exactly when the grid is already adequate, so `max` never escalates when it does
-//! not have to, and the old step function (`n_out` one below the threshold → 1 lane, one above → 32)
-//! is gone: `lanes` tracks `MIN_BLOCKS * BLOCK / n_out` continuously.
-//!
-//! The CPU's split is inherited from a different question ("is there a slice to hand to
-//! `unrolled_binary_reduce`?"). On the GPU the questions are only: which axis is unit-stride, and is
-//! there enough work to fill a machine.
+//! not have to, and `lanes = 1` (thread-per-output) is the fixed point rather than a branch.
 //!
 //! **The lanes sit on the unit-stride axis, in the low thread bits**, so consecutive lanes are
 //! consecutive addresses *and* co-lanes share a warp. That second half is what keeps the tree a
-//! `__shfl_down_sync` chain while `lanes <= 32`; CuPy puts the output index in the low bits instead
-//! and pays for it with a shared-memory tree in every reduction it runs.
+//! `__shfl_down_sync` chain while `lanes <= 32`.
+//!
+//! # One linear run per part
+//!
+//! Both the contracted part and the output part are reduced to a single number: the element step per
+//! unit of the index. Two tests, because the two parts have different obligations: [`block_step`]
+//! asks only that the contracted axes form one contiguous block *as a set* (axis order is free — no
+//! summation order is promised), while [`output_step`] additionally requires shape order, because
+//! `c[j]` counts in shape order.
+//!
+//! That one test replaces the previous per-axis contiguity-prefix intersection, and it is what lets
+//! multi-axis contractions work at all: `(p, i, j)` contracted over `(i, j)` yields a `[i, j]` part
+//! with strides `[j, 1]`, step 1, and the kernel walks it with `m` exactly as it walks a single axis.
+//! A rank-0 output — a full reduction — is the same story with `n_out = 1` and no step.
 //!
 //! # Lanes above a warp are allowed, and cost something
 //!
 //! [`WARP_LANES`] is the *free* ceiling, not the hard one. Past 32 the partial sums of one output
 //! span several warps, so the kernel needs a shared-memory stage and a `__syncthreads()` — roughly
-//! one round trip, fixed. That is worth paying when the alternative is a starved grid: at
-//! `n_out = 1000` with a long contraction, 32 lanes give 125 blocks (1.2 per SM) and 256 lanes give
-//! 1000 blocks. The tree costs tens of cycles; the occupancy difference is several-fold bandwidth.
-//!
-//! So [`MAX_LANES`] is a whole block and the kernel carries both stages. `lanes` is substituted at
-//! NVRTC time (`@LANES@`), so the stage is compiled out whenever `lanes <= 32`.
-//!
-//! The one term this deliberately does not model: with a strided contraction, a large `lanes` drives
-//! `outputs_per_block` down, and neighbouring outputs are what share a 32 B sector. At
-//! `lanes = BLOCK` each block owns one output, so sector sharing moves from L1 to L2. DRAM traffic is
-//! unchanged either way and occupancy dominates in the starved regime — but this is the term to
-//! revisit once there are numbers.
-//!
-//! # What is refused
-//!
-//! Only shapes the kernel set can address at all are planned. Everything else raises by name:
-//!
-//! - a multi-axis contracted or output part (the kernel walks `m` and writes `c[j]` with a single
-//!   step each) — `UnImplemented`;
-//! - an output that is not contiguous — `InvalidLayout`, since that is a caller defect rather than a
-//!   missing kernel;
-//! - no unit-stride run on either axis — `UnImplemented`. Packing a contiguous copy and re-planning
-//!   is the eventual answer here; there is no plan for it yet, and pretending otherwise would hide
-//!   the refusal behind a slow path.
+//! one round trip, fixed. Worth paying when the alternative is a starved grid.
 //!
 //! # Reproducibility
 //!
@@ -115,11 +97,12 @@ pub(crate) struct ReducePlan {
     pub(crate) outputs_per_block: u32,
     /// Threads per block.
     pub(crate) block: u32,
-    /// Contracted length walked by each lane group, and its element stride in each operand.
+    /// Contracted length walked by each lane group, and its element step per contracted index.
     pub(crate) n_contract: usize,
     pub(crate) step_a: isize,
     pub(crate) step_b: isize,
-    /// Output count, and the element stride of the (single) output axis in each operand.
+    /// Output count, and the element step per output index in each operand. `0` when the output is
+    /// rank 0 — there is only one output, so the step is never taken.
     pub(crate) n_out: usize,
     pub(crate) out_step_a: isize,
     pub(crate) out_step_b: isize,
@@ -133,41 +116,72 @@ impl ReducePlan {
     }
 }
 
-/// Longest run of axes contiguous in *both* operand lists, taken from the front.
+/// Element step per unit of the **contracted** index, when those axes form one contiguous block as a
+/// set — in *any* axis order.
 ///
-/// `get_axes_composition` returns the contiguous axes as a prefix built by walking `|stride|` up
-/// from 1, so a common prefix across two operands is a run both can stream together. Semantics
-/// copied from the CPU's `flag_contig_s` (`cpu_serial/vecdot.rs:46-54`) — they are load-bearing.
-fn shared_prefix_2(a: &[usize], b: &[usize]) -> Vec<usize> {
-    let mut out = Vec::new();
-    for (ia, ib) in izip!(a.iter(), b.iter()) {
-        if ia == ib {
-            out.push(*ia);
-        } else {
-            break;
-        }
+/// Order is free here. A reduction makes no claim about summation order (see `reduce.rs`), so walking
+/// a column-major `[i, j]` block as `m = 0..i*j` with step 1 reads every element exactly once; only
+/// the accumulation order differs, and that is not part of the contract. So the test is "are the axes
+/// sorted by `|stride|` an arithmetic progression", not "are they row-major".
+///
+/// The step reported is the innermost one, so the block may be non-unit (`[64, 2]` over `[8, 8]`) —
+/// the caller only gets to assume *constant* stride, not unit stride.
+///
+/// `None` when the block has a gap (strides `[16, 1]` over `[8, 8]`), a repeated stride, or when the
+/// axes disagree about direction.
+fn block_step(l: &Layout<IxD>) -> Option<isize> {
+    let n = l.ndim();
+    if n == 0 {
+        return None;
     }
-    out
+    // Innermost axis first, by absolute stride; the *order* of the axes is exactly what we are
+    // allowed to ignore, so sorting is the whole point rather than a convenience.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&k| l.stride()[k].unsigned_abs());
+
+    let step = l.stride()[order[0]];
+    let mut expect = step;
+    for &k in &order {
+        if l.stride()[k] != expect {
+            return None;
+        }
+        expect *= l.shape()[k] as isize;
+    }
+    Some(step)
 }
 
-/// Same, for the three-way intersection the output side needs (`a`, `b` and `c`).
-fn shared_prefix_3(a: &[usize], b: &[usize], c: &[usize]) -> Vec<usize> {
-    let mut out = Vec::new();
-    for (ia, ib, ic) in izip!(a.iter(), b.iter(), c.iter()) {
-        if ia == ib && ib == ic {
-            out.push(*ia);
-        } else {
-            break;
-        }
+/// Element step per unit of the **output** index, when the axes are a row-major block in shape order.
+///
+/// Order is *not* free here. The kernel writes `c[j]` with `j` counting in shape order, into a fresh
+/// layout that is contiguous in the device's keep order, so `a[j] = base + j * step` addresses the
+/// right element only if the operand's output axes advance in that same order. A column-major output
+/// block would need `c[perm(j)]`, a reordering we do not perform — so it is refused rather than
+/// silently transposed.
+///
+/// `None` for a rank-0 layout (nothing to walk) and for anything with a gap or a permuted axis.
+fn output_step(l: &Layout<IxD>) -> Option<isize> {
+    let n = l.ndim();
+    if n == 0 {
+        return None;
     }
-    out
+    let step = l.stride()[n - 1];
+    let mut expect = step;
+    for k in (0..n).rev() {
+        if l.stride()[k] != expect {
+            return None;
+        }
+        expect *= l.shape()[k] as isize;
+    }
+    Some(step)
 }
 
-/// Decide how to decompose `c[out] = sum_contract a * b`.
+/// Decide how to decompose a contraction or a reduction over `axes`.
 ///
-/// `axes_a` / `axes_b` are the contracted axes in the normalised `isize` form the device trait
-/// takes. `order` is the device's default order, needed because the output layout is aligned against
-/// the operands' remaining axes before the runs are compared.
+/// `la` / `lb` are the two operands of a contraction; a unary reduction passes the same layout for
+/// both, so `step_b` / `out_step_b` come out equal to their `a` counterparts and are simply unused.
+/// `axes_a` / `axes_b` are the contracted axes in the normalised `isize` form the device trait takes.
+/// `order` is the device's default order, needed because the output layout is aligned against the
+/// operands' remaining axes before the parts are tested.
 pub(crate) fn classify_reduce(
     la: &Layout<IxD>,
     lb: &Layout<IxD>,
@@ -198,32 +212,16 @@ pub(crate) fn classify_reduce(
     let n_contract = las.size();
     let n_out = lc.size();
 
-    // --- admissibility -------------------------------------------------------------------------
-    //
-    // One axis per part, because the kernel walks `m` and writes `c[j]` with a single step each.
-    // Collapsing several axes into a run is the next increment: the run lengths below are already
-    // computed correctly for it, only the linear index arithmetic is missing.
-    if las.ndim() != 1 || lbs.ndim() != 1 {
+    // The output must be walkable as `c[j]`: a row-major block whose innermost step is 1. A rank-0
+    // output is the single-element case and needs no step at all.
+    let c_ok = if lc.ndim() == 0 { n_out == 1 } else { output_step(&lc) == Some(1) };
+    if !c_ok {
         rstsr_raise!(
-            UnImplemented,
-            "cuda vecdot: contracted part is not a single axis (ranks {} and {})",
-            las.ndim(),
-            lbs.ndim()
+            InvalidLayout,
+            "cuda reduce: output must be a contiguous run with unit step (rank {}, strides {:?})",
+            lc.ndim(),
+            lc.stride()
         )?;
-    }
-    if lam.ndim() != 1 || lbm.ndim() != 1 {
-        rstsr_raise!(
-            UnImplemented,
-            "cuda vecdot: output part is not a single axis (ranks {} and {})",
-            lam.ndim(),
-            lbm.ndim()
-        )?;
-    }
-    // Checked after the rank tests but before the layout analysis: a strided output layout is a
-    // defect of the *output*, and reporting "no unit-stride run" for it would blame the operand
-    // strides instead.
-    if lc.ndim() != 1 || lc.stride()[0] != 1 {
-        rstsr_raise!(InvalidLayout, "cuda vecdot: output must be contiguous (rank {}, stride {:?})", lc.ndim(), lc.stride())?;
     }
 
     // Empty contraction or output: a zero-block launch. `next_power_of_two` maps 0 to 1, so the
@@ -237,46 +235,85 @@ pub(crate) fn classify_reduce(
             step_a: 1,
             step_b: 1,
             n_out,
-            out_step_a: 1,
-            out_step_b: 1,
+            out_step_a: 0,
+            out_step_b: 0,
         });
     }
 
-    let step_a = las.stride()[0];
-    let step_b = lbs.stride()[0];
-    let out_step_a = lam.stride()[0];
-    let out_step_b = lbm.stride()[0];
+    // --- one linear run per part ----------------------------------------------------------------
+    // A rank-0 contracted part is *one element* — `axes` was empty, or the operand is 0-d — so there
+    // is nothing to walk and any step is correct. This is `sum(t, &[])`, which reduces to a copy, and
+    // `sum` of a 0-d tensor. Without this, `block_step` answers "nothing to walk" and every such call
+    // is refused.
+    let step_a = if las.ndim() == 0 {
+        1
+    } else {
+        let Some(step) = block_step(&las) else {
+            rstsr_raise!(
+                UnImplemented,
+                "cuda reduce: contracted part is not one contiguous block (shape {:?}, strides {:?})",
+                las.shape(),
+                las.stride()
+            )?
+        };
+        step
+    };
+    let step_b = if lbs.ndim() == 0 {
+        1
+    } else {
+        let Some(step) = block_step(&lbs) else {
+            rstsr_raise!(
+                UnImplemented,
+                "cuda reduce: contracted part of b is not one contiguous block (shape {:?}, strides {:?})",
+                lbs.shape(),
+                lbs.stride()
+            )?
+        };
+        step
+    };
 
-    // --- which axis can carry the lanes ---------------------------------------------------------
-    let (_, _, asc_a, _) = get_axes_composition(&las);
-    let (_, _, asc_b, _) = get_axes_composition(&lbs);
-    let (_, _, amc_a, _) = get_axes_composition(&lam);
-    let (_, _, amc_b, _) = get_axes_composition(&lbm);
-    let (_, _, amc_c, _) = get_axes_composition(&lc_aligned);
+    // A rank-0 output is one element; its step is never taken, and reporting 0 keeps the kernel's
+    // address arithmetic well defined rather than something that could overflow.
+    let (out_step_a, out_step_b) = if lam.ndim() == 0 && lbm.ndim() == 0 {
+        (0, 0)
+    } else {
+        let Some(a) = output_step(&lam) else {
+            rstsr_raise!(
+                UnImplemented,
+                "cuda reduce: output part is not a row-major run in shape order (shape {:?}, strides {:?})",
+                lam.shape(),
+                lam.stride()
+            )?
+        };
+        let Some(b) = output_step(&lbm) else {
+            rstsr_raise!(
+                UnImplemented,
+                "cuda reduce: output part of b is not a row-major run in shape order (shape {:?}, strides {:?})",
+                lbm.shape(),
+                lbm.stride()
+            )?
+        };
+        (a, b)
+    };
 
-    let con_run: usize = shared_prefix_2(&asc_a, &asc_b).iter().map(|&i| las.shape()[i]).product();
-    let out_run: usize = shared_prefix_3(&amc_a, &amc_b, &amc_c).iter().map(|&i| lam.shape()[i]).product();
+    // Does the contraction stream unit-stride (so lanes are free), and does the output stream
+    // unit-stride (so one thread per output is coalesced)?
+    let con_is_run = step_a == 1 && step_b == 1;
+    let out_is_run = if lam.ndim() == 0 { n_out == 1 } else { out_step_a == 1 && out_step_b == 1 };
 
-    // A run of length 1 is trivially contiguous, which is why the products start at 1 rather than
-    // the flags being guarded by `is_empty()`.
-    let con_is_run = con_run == n_contract;
-    let out_is_run = out_run == n_out;
-
-    // No unit-stride axis anywhere: no thread mapping is coalesced. Packing would fix it; there is
-    // no packing pass yet, so refuse rather than launch something known to be bad.
+    // Neither: no thread mapping is coalesced. Packing would fix it; there is no packing pass yet,
+    // so refuse rather than launch something known to be bad.
     if !con_is_run && !out_is_run {
         rstsr_raise!(
             UnImplemented,
-            "cuda vecdot: no unit-stride run on either the contracted or the output axis \
-             (contracted run {con_run}, output run {out_run} of {n_contract} x {n_out})"
+            "cuda reduce: no unit-stride run on either the contracted or the output axis \
+             (steps {step_a}/{step_b} in, {out_step_a}/{out_step_b} out)"
         )?;
     }
 
     // --- lanes, with no branch ------------------------------------------------------------------
     //
-    // `need >= free` exactly when the grid is short, so the `max` alone decides the regime: a large
-    // `n_out` collapses `need` to 1 and the plan is thread-per-output; a small one drives it up
-    // until the grid is full or the contraction cannot fill more lanes.
+    // `need >= free` exactly when the grid is short, so the `max` alone decides the regime.
     let lanes_free = if con_is_run { n_contract.next_power_of_two().min(WARP_LANES as usize) } else { 1 };
     let lanes_cap = n_contract.next_power_of_two().min(MAX_LANES as usize);
     let lanes_need = (MIN_BLOCKS * BLOCK).div_ceil(n_out);
@@ -300,9 +337,14 @@ pub(crate) fn classify_reduce(
 mod tests {
     use super::*;
 
+    /// Build a layout, panicking if RSTSR rejects it.
+    ///
+    /// The constructor's no-overlap check is stricter than "no two elements collide": walking the
+    /// axes in increasing `|stride|`, it keeps `elem_cum = max_index_seen + 1` and requires
+    /// `elem_cum < next_stride` (`layoutbase.rs:337`). So a *gapped* block is legal only if the next
+    /// axis's stride clears the block's whole span, holes included — 64 elements laid out as eight
+    /// 8-element runs 16 apart span 120 slots, and the axis above them needs stride ≥ 120, not 64.
     fn layout(shape: &[usize], stride: &[isize], offset: usize) -> Layout<IxD> {
-        // `Layout::new` takes `offset: usize`; keep this helper's signature matching it rather than
-        // converting at every call site.
         Layout::<IxD>::new(shape.to_vec().into(), stride.to_vec().into(), offset).unwrap()
     }
 
@@ -311,14 +353,47 @@ mod tests {
         (layout(&shape, &[shape[1] as isize, 1], 0), layout(&[n_out], &[1], 0))
     }
 
-    /// `(lanes, outputs_per_block, grid)`.
     fn geometry(plan: ReducePlan) -> (u32, u32, usize) {
         (plan.lanes, plan.outputs_per_block, plan.grid_blocks())
     }
 
-    /// Contraction is the last axis, so it is the unit-stride one. `n_out = 1000` is far short of
-    /// the grid target, so lanes escalate past a warp: 1000 blocks at one output each, not 125 at
-    /// eight.
+    /// The contracted part only has to be a contiguous block *as a set*: axis order is free, because
+    /// no summation order is promised.
+    #[test]
+    fn block_step_ignores_axis_order() {
+        // one axis, any stride
+        assert_eq!(block_step(&layout(&[64], &[1], 0)), Some(1));
+        assert_eq!(block_step(&layout(&[64], &[1000], 0)), Some(1000));
+        // row-major block
+        assert_eq!(block_step(&layout(&[8, 8], &[8, 1], 0)), Some(1));
+        // constant but not unit
+        assert_eq!(block_step(&layout(&[8, 8], &[16, 2], 0)), Some(2));
+        // column-major block: same element set, enumerated the other way round — admissible
+        assert_eq!(block_step(&layout(&[8, 8], &[1, 8], 0)), Some(1));
+        // a gap between the two runs: not one block
+        assert_eq!(block_step(&layout(&[8, 8], &[16, 1], 0)), None);
+        // a hole inside the outer axis
+        assert_eq!(block_step(&layout(&[8, 8], &[9, 1], 0)), None);
+        // rank 0 has nothing to walk
+        assert_eq!(block_step(&layout(&[], &[], 0)), None);
+    }
+
+    /// The output part does require shape order: `c[j]` counts in shape order, so a column-major
+    /// output block would need `c[perm(j)]`, which we do not do.
+    #[test]
+    fn output_step_requires_shape_order() {
+        assert_eq!(output_step(&layout(&[64], &[1], 0)), Some(1));
+        assert_eq!(output_step(&layout(&[64], &[1000], 0)), Some(1000));
+        assert_eq!(output_step(&layout(&[8, 8], &[8, 1], 0)), Some(1));
+        assert_eq!(output_step(&layout(&[8, 8], &[16, 2], 0)), Some(2));
+        // column-major: refused here, admitted by `block_step`
+        assert_eq!(output_step(&layout(&[8, 8], &[1, 8], 0)), None);
+        assert_eq!(output_step(&layout(&[8, 8], &[9, 1], 0)), None);
+        assert_eq!(output_step(&layout(&[], &[], 0)), None);
+    }
+
+    /// Contraction is the last axis, so it is the unit-stride one. `n_out = 1000` is far short of the
+    /// grid target, so lanes escalate past a warp: 1000 blocks at one output each.
     #[test]
     fn contracted_run_escalates_lanes_to_fill_the_grid() {
         let (n_p, n_i) = (1000usize, 10240usize);
@@ -326,16 +401,12 @@ mod tests {
         let plan = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap();
 
         assert_eq!(geometry(plan), (256, 1, 1000));
-        assert!(plan.lanes > 1, "cooperative");
-        assert!(plan.lanes > WARP_LANES, "256 lanes need the cross-warp stage");
         assert_eq!(plan.step_a, 1, "contracted axis is unit-stride");
         assert_eq!(plan.out_step_a, n_i as isize, "output axis is strided");
-        assert_eq!(plan.n_contract, n_i);
     }
 
-    /// The same tensor with a wide output: 782 blocks are already enough, so `need` collapses to 1
-    /// and the plan is thread-per-output — the old `ContigM`, reached as a fixed point rather than
-    /// by a branch.
+    /// Wide output, strided contraction: 782 blocks are already enough, so `need` collapses to 1 and
+    /// the plan is thread-per-output.
     #[test]
     fn wide_output_is_thread_per_output() {
         let (n_i, n_p) = (1024usize, 200_000usize);
@@ -343,7 +414,6 @@ mod tests {
         let plan = classify_reduce(&la, &la, &lc, &[0], &[0], RowMajor).unwrap();
 
         assert_eq!(geometry(plan), (1, 256, 782));
-        assert_eq!(plan.lanes, 1, "one thread per output, no tree");
         assert_eq!(plan.step_a, n_p as isize, "contracted axis is strided");
         assert_eq!(plan.out_step_a, 1, "output axis is unit-stride, so the warp is contiguous");
     }
@@ -355,126 +425,144 @@ mod tests {
         let (n_i, n_p) = (10240usize, 1000usize);
         let (la, lc) = pair([n_i, n_p], n_p);
         let plan = classify_reduce(&la, &la, &lc, &[0], &[0], RowMajor).unwrap();
-
         assert_eq!(geometry(plan), (256, 1, 1000));
-        assert_eq!(plan.step_a, n_p as isize, "lanes are on the strided axis and that is deliberate");
     }
 
-    /// 8 outputs. Thread-per-output would launch 8 threads; the grid target gives 8 *blocks* of 256.
-    /// Splitting further is split-K's job, not the plan's.
+    /// Two contracted axes that form one row-major block. This is what `sum(axis=(i,j))` and a
+    /// two-axis `vecdot` both produce, and it was refused before the linear-run test.
     #[test]
-    fn tiny_output_gets_one_block_per_output() {
-        let (n_i, n_p) = (10024usize, 8usize);
-        let (la, lc) = pair([n_i, n_p], n_p);
+    fn multi_axis_contraction_is_one_run() {
+        // (p, i, j) C-order, contracting (i, j) => contracted part [i, j] with strides [j, 1].
+        let (p, i, j) = (4usize, 8usize, 8usize);
+        let la = layout(&[p, i, j], &[(i * j) as isize, j as isize, 1], 0);
+        let lc = layout(&[p], &[1], 0);
+
+        let plan = classify_reduce(&la, &la, &lc, &[1, 2], &[1, 2], RowMajor).unwrap();
+        assert_eq!(plan.n_contract, i * j);
+        assert_eq!(plan.n_out, p);
+        assert_eq!(plan.step_a, 1, "the [i, j] block is row-major, so m walks it at stride 1");
+        assert_eq!(plan.out_step_a, (i * j) as isize);
+        assert_eq!(geometry(plan), (64, 4, 1));
+    }
+
+    /// Two output axes that form one row-major block: contract the leading axis of a rank-3 tensor.
+    #[test]
+    fn multi_axis_output_is_one_run() {
+        let (r, a, b) = (4usize, 8usize, 8usize);
+        let la = layout(&[r, a, b], &[(a * b) as isize, b as isize, 1], 0);
+        let lc = layout(&[a, b], &[b as isize, 1], 0);
+
         let plan = classify_reduce(&la, &la, &lc, &[0], &[0], RowMajor).unwrap();
-        assert_eq!(geometry(plan), (256, 1, 8));
+        assert_eq!(plan.n_contract, r);
+        assert_eq!(plan.n_out, a * b);
+        assert_eq!(plan.out_step_a, 1, "the [a, b] output block is contiguous");
+        assert_eq!(plan.step_a, (a * b) as isize, "the contracted axis is strided");
     }
 
-    /// Short contractions cannot fill many lanes, so `cap` binds and the lane count shrinks instead
-    /// of the plan being refused.
+    /// A full reduction: rank-0 output, one element, one block, everything cooperating.
     #[test]
-    fn short_contraction_shrinks_lanes() {
-        // i = 8 => 8 lanes, 32 outputs per block.
-        let (n_p, n_i) = (1_000_000usize, 8usize);
-        let (la, lc) = pair([n_p, n_i], n_p);
-        let plan = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap();
-        assert_eq!(geometry(plan), (8, 32, 31_250));
+    fn rank_zero_output_is_one_block() {
+        let la = layout(&[100, 1024], &[1024, 1], 0);
+        let lc = layout(&[], &[], 0);
 
-        // i = 3 => 4 lanes, 64 outputs per block.
-        let (n_p, n_i) = (100usize, 3usize);
-        let (la, lc) = pair([n_p, n_i], n_p);
-        let plan = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap();
-        assert_eq!(geometry(plan), (4, 64, 2));
-
-        // i = 1 => nothing to split, so the plan is the degenerate thread-per-output.
-        let (n_p, n_i) = (4096usize, 1usize);
-        let (la, lc) = pair([n_p, n_i], n_p);
-        let plan = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap();
-        assert_eq!(geometry(plan), (1, 256, 16));
-    }
-
-    /// The old `4 * BLOCK` gate refused this shape. 1023 elements cannot fill 256 lanes, so the cap
-    /// binds and each lane gets four elements — a geometry question, not a refusal.
-    #[test]
-    fn below_the_old_gate_still_gets_a_plan() {
-        let (n_p, n_i) = (11usize, 1023usize);
-        let (la, lc) = pair([n_p, n_i], n_p);
-        let plan = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap();
-        assert_eq!(geometry(plan), (256, 1, 11));
-    }
-
-    /// A scalar output is one block. The plan says so rather than pretending; splitting it needs a
-    /// second pass, which is a separate feature.
-    #[test]
-    fn scalar_output_is_one_block() {
-        let (la, lc) = pair([1, 100_000], 1);
-        let plan = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap();
+        let plan = classify_reduce(&la, &la, &lc, &[0, 1], &[0, 1], RowMajor).unwrap();
+        assert_eq!(plan.n_out, 1);
+        assert_eq!(plan.n_contract, 100 * 1024);
+        assert_eq!(plan.out_step_a, 0, "a single output never takes a step");
         assert_eq!(geometry(plan), (256, 1, 1));
     }
 
-    /// Each refusal names its own reason. The first used to be asserted against the wrong message: a
-    /// strided `lc` is caught by the contiguity guard, whose reason is "output must be contiguous"
-    /// and never "unit-stride".
+    /// `axes == []` and 0-d operands: the contracted part is one element, so the plan is a copy.
+    /// `sum(t, &[])` and `sum` of a 0-d tensor both land here, and both used to be refused because
+    /// `block_step` answers "nothing to walk" for a rank-0 layout.
     #[test]
-    fn inadmissible_shapes_are_rejected_by_name() {
-        // Strided output layout: caught by the contiguity guard, and reported as InvalidLayout.
-        let la = layout(&[64, 512], &[1024, 2], 0);
-        let lc = layout(&[64], &[2], 0);
-        let e = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap_err();
-        let msg = format!("{e}");
-        assert!(msg.contains("output must be contiguous"), "got: {msg}");
-        assert!(msg.contains("InvalidLayout"), "got: {msg}");
+    fn empty_axes_is_a_copy() {
+        let la = layout(&[5], &[1], 0);
+        let lc = layout(&[5], &[1], 0);
+        let plan = classify_reduce(&la, &la, &lc, &[], &[], RowMajor).unwrap();
+        assert_eq!((plan.n_contract, plan.n_out), (1, 5));
+        assert_eq!(plan.lanes, 1, "one element per output: nothing to share");
+        assert_eq!(plan.out_step_a, 1);
+        assert_eq!(plan.grid_blocks(), 1);
 
-        // Contiguous output, but no unit-stride axis in either operand: nothing to coalesce on.
+        // 0-d operand: one element in, one element out.
+        let l0 = layout(&[], &[], 0);
+        let plan = classify_reduce(&l0, &l0, &l0, &[], &[], RowMajor).unwrap();
+        assert_eq!((plan.n_contract, plan.n_out), (1, 1));
+        assert_eq!(plan.out_step_a, 0, "a single output never takes a step");
+        assert_eq!(plan.grid_blocks(), 1);
+    }
+
+    /// A column-major *contracted* block is admitted: the element set is contiguous, and no summation
+    /// order is promised, so enumerating it in stride order reads exactly the same elements.
+    #[test]
+    fn column_major_contraction_is_admitted() {
+        // i and j transposed in memory: element (p, i, j) lives at p*64 + i + j*8, so each output's
+        // 64 contracted elements are still one contiguous run.
+        let la = layout(&[4, 8, 8], &[64, 1, 8], 0);
+        let lc = layout(&[4], &[1], 0);
+        let plan = classify_reduce(&la, &la, &lc, &[1, 2], &[1, 2], RowMajor).unwrap();
+        assert_eq!(plan.n_contract, 64);
+        assert_eq!(plan.step_a, 1, "contiguous block; only the axis order differs");
+    }
+
+    /// A contracted block with a *gap* cannot be walked with one step: refused, because guessing
+    /// would silently read the wrong elements.
+    #[test]
+    fn gapped_contraction_is_refused() {
+        // Eight 8-element runs, 16 apart: the 64 contracted elements span 120 slots with 56 holes,
+        // so the output axis must clear 120 (hence 128, not 64) or the layout is rejected as
+        // overlapping before `classify_reduce` ever sees it.
+        let la = layout(&[4, 8, 8], &[128, 16, 1], 0);
+        let lc = layout(&[4], &[1], 0);
+        let e = classify_reduce(&la, &la, &lc, &[1, 2], &[1, 2], RowMajor).unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("not one contiguous block"), "got: {msg}");
+    }
+
+    /// No unit-stride step anywhere: correct but uncoalesced, so refused until packing exists.
+    #[test]
+    fn stepped_on_both_sides_is_refused() {
         let la = layout(&[64, 512], &[1024, 2], 0);
         let lc = layout(&[64], &[1], 0);
         let e = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("no unit-stride run"), "got: {msg}");
         assert!(msg.contains("UnImplemented"), "got: {msg}");
-
-        // Multi-axis output part: correct, but not expressible with one `out_step`. The output
-        // layout must already have the contracted axis' rank removed, or the broadcast check fires
-        // first.
-        let la = layout(&[4, 8, 8], &[64, 8, 1], 0);
-        let lc = layout(&[4, 8], &[8, 1], 0);
-        let e = classify_reduce(&la, &la, &lc, &[2], &[2], RowMajor).unwrap_err();
-        let msg = format!("{e}");
-        assert!(msg.contains("output part is not a single axis"), "got: {msg}");
     }
 
-    /// The lane count must track the grid target continuously: shrinking `n_out` by 2x must raise
-    /// `lanes` by at most 2x, never jump from 1 straight to a whole block.
+    /// A non-contiguous output is a caller defect, reported as such rather than as a missing kernel.
     #[test]
-    fn lane_count_is_continuous_across_the_threshold() {
-        let n_i = 1024usize;
-        let mut previous = 0u32;
-        for n_p in [262_144usize, 131_072, 65_536, 8192, 4096, 2048, 1024, 512] {
-            let (la, lc) = pair([n_p, n_i], n_p);
-            let plan = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap();
-            let (lanes, _, blocks) = geometry(plan);
-
-            assert!(blocks >= MIN_BLOCKS, "n_out={n_p}: {blocks} blocks is short of {MIN_BLOCKS}");
-            assert!(lanes >= previous, "n_out={n_p}: lanes fell from {previous} to {lanes}");
-            if previous != 0 {
-                assert!(lanes <= previous * 2, "n_out={n_p}: lanes jumped {previous} -> {lanes}");
-            }
-            previous = lanes;
-        }
-        // 512 outputs of a 1024-long contraction: one block per output, the old `ContigS` corner.
-        let (la, lc) = pair([512, n_i], 512);
-        assert_eq!(geometry(classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap()), (256, 1, 512));
+    fn non_contiguous_output_is_a_layout_error() {
+        let la = layout(&[64, 512], &[1024, 1], 0);
+        let lc = layout(&[64], &[2], 0);
+        let e = classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("output must be a contiguous run"), "got: {msg}");
+        assert!(msg.contains("InvalidLayout"), "got: {msg}");
     }
 
-    /// The shapes the GPU integration tests use, one per lane count the classifier can emit.
-    ///
-    /// Each lane count is a separately compiled kernel (`@LANES@` is a token), so the integration
-    /// tests are only meaningful if these shapes still land on those counts. This test is the host
-    /// half of that contract: it fails before anyone rents a GPU. Keep it in step with
-    /// `VECDOT_CASES` in `tests/test_kernels.rs`.
+    /// Short contractions shrink `lanes` instead of falling out of the plan.
+    #[test]
+    fn short_contraction_shrinks_lanes() {
+        let (n_p, n_i) = (1_000_000usize, 8usize);
+        let (la, lc) = pair([n_p, n_i], n_p);
+        assert_eq!(geometry(classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap()), (8, 32, 31_250));
+
+        let (n_p, n_i) = (100usize, 3usize);
+        let (la, lc) = pair([n_p, n_i], n_p);
+        assert_eq!(geometry(classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap()), (4, 64, 2));
+
+        let (n_p, n_i) = (4096usize, 1usize);
+        let (la, lc) = pair([n_p, n_i], n_p);
+        assert_eq!(geometry(classify_reduce(&la, &la, &lc, &[1], &[1], RowMajor).unwrap()), (1, 256, 16));
+    }
+
+    /// The shapes the GPU integration tests use, one per lane count. Each lane count is a separately
+    /// compiled kernel (`@LANES@` is a token), so this is the host half of that contract: it fails
+    /// before anyone rents a GPU. Keep in step with `VECDOT_CASES` in `tests/test_kernels.rs`.
     #[test]
     fn one_gpu_case_per_lane_count() {
-        // (rows, cols, contracted axis, expected lanes)
         let cases: &[(usize, usize, isize, u32)] = &[
             (2, 131_072, 0, 1),
             (8, 100_000, 0, 2),
@@ -502,9 +590,7 @@ mod tests {
         }
     }
 
-    /// Invariants that must hold for every shape that is planned at all, in both orientations. This
-    /// is the test that would have caught the earlier vacuous gate test: it asserts properties of
-    /// the *plan*, so it cannot pass by refusing.
+    /// The plan must stay a legal geometry for every shape it accepts.
     #[test]
     fn plan_invariants_hold() {
         let cases: &[(usize, usize)] = &[
@@ -532,11 +618,6 @@ mod tests {
 
                 assert!(plan.lanes.is_power_of_two(), "lanes must be a power of two: {}", plan.lanes);
                 assert!(plan.lanes <= MAX_LANES, "lanes capped at {MAX_LANES}: {}", plan.lanes);
-                assert!(
-                    plan.lanes <= n_contract.next_power_of_two().min(MAX_LANES as usize) as u32,
-                    "lanes exceed what a {n_contract}-long contraction can fill: {}",
-                    plan.lanes
-                );
                 assert_eq!(plan.block % plan.lanes, 0, "block must divide by lanes");
                 assert_eq!(plan.lanes * plan.outputs_per_block, plan.block);
                 assert_eq!(plan.n_contract, n_contract);
