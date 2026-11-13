@@ -15,7 +15,14 @@
 //! l2_norm  0         A + X*X                 A + B         sqrt(V)
 //! min      +inf      RSTSR_MIN(A, X)         RSTSR_MIN     V
 //! max      -inf      RSTSR_MAX(A, X)         RSTSR_MAX     V
+//! all      1         A & X                   A & B         V != 0
+//! any      0         A | X                   A | B         V != 0
+//! count_nz 0         A + (X != 0)            A + B         V
 //! ```
+//!
+//! The last three are the rows whose accumulator is *not* the operand type: `all`/`any` fold into an
+//! `int` and `count_nonzero` into an `unsigned long long`, which is why the accumulator travels as an
+//! [`AccSpec`] value rather than being inferred from `T`.
 //!
 //! # Three types, not one
 //!
@@ -81,6 +88,18 @@ pub(crate) struct AccSpec {
     pub neg_inf: &'static str,
 }
 
+impl AccSpec {
+    /// Accumulator for the predicates: `all`/`any` fold into an `int`, not a `bool`, because
+    /// `__shfl_down_sync` has no `bool` overload and an integer promotion in the overload set is
+    /// one silent conversion more than this needs.
+    pub(crate) const INT: AccSpec = AccSpec { cname: "int", pos_inf: "", neg_inf: "" };
+
+    /// Accumulator for the counting rows (`count_nonzero`, `sum` over `bool`). `usize` and `u64` are
+    /// both `unsigned long long` on the device, which is what `CudaDType` gives them.
+    pub(crate) const U64: AccSpec =
+        AccSpec { cname: "unsigned long long", pos_inf: "", neg_inf: "" };
+}
+
 /// The accumulator types the fold table can be written in.
 ///
 /// This exists for the two infinities, not for the name: NVRTC is not assumed to provide
@@ -116,6 +135,9 @@ pub(crate) enum UnaryOp {
     L2Norm,
     Min,
     Max,
+    All,
+    Any,
+    CountNonZero,
 }
 
 impl UnaryOp {
@@ -128,6 +150,9 @@ impl UnaryOp {
             Self::L2Norm => "l2_norm",
             Self::Min => "min",
             Self::Max => "max",
+            Self::All => "all",
+            Self::Any => "any",
+            Self::CountNonZero => "count_nonzero",
         }
     }
 
@@ -139,8 +164,10 @@ impl UnaryOp {
     /// needed here, only in [`Self::post`].
     fn init(self, acc: &str, pos_inf: &str, neg_inf: &str) -> String {
         match self {
-            Self::Sum | Self::Mean | Self::L2Norm => format!("({acc})0"),
-            Self::Prod => format!("({acc})1"),
+            Self::Sum | Self::Mean | Self::L2Norm | Self::Any | Self::CountNonZero => {
+                format!("({acc})0")
+            },
+            Self::Prod | Self::All => format!("({acc})1"),
             Self::Min => pos_inf.to_string(),
             Self::Max => neg_inf.to_string(),
         }
@@ -154,6 +181,11 @@ impl UnaryOp {
             Self::Min => "RSTSR_MIN((A), (@TACC@)(X))",
             Self::Max => "RSTSR_MAX((A), (@TACC@)(X))",
             Self::L2Norm => "((A) + (@TACC@)(X) * (@TACC@)(X))",
+            // `(int)(X)` on a `bool` is 0/1, so `&` and `|` are the folds and the tree stays integer.
+            Self::All => "((A) & (@TACC@)(X))",
+            Self::Any => "((A) | (@TACC@)(X))",
+            // The cast wraps the *predicate*, not the element: there is no widening to do here.
+            Self::CountNonZero => "((A) + (@TACC@)((X) != (@TIN@)0))",
         }
     }
 
@@ -165,6 +197,9 @@ impl UnaryOp {
             Self::Prod => "((A) * (B))",
             Self::Min => "RSTSR_MIN((A), (B))",
             Self::Max => "RSTSR_MAX((A), (B))",
+            Self::All => "((A) & (B))",
+            Self::Any => "((A) | (B))",
+            Self::CountNonZero => "((A) + (B))",
         }
     }
 
@@ -177,6 +212,9 @@ impl UnaryOp {
             // (`layout_axes.size()`), and the cast keeps the division in the accumulator's type.
             Self::Mean => "((V) / (@TACC@)n_contract)",
             Self::L2Norm => "sqrt(V)",
+            // The tree ran in `int`; the output dtype is `bool`.
+            Self::All | Self::Any => "((V) != 0)",
+            Self::CountNonZero => "(V)",
         }
     }
 
@@ -362,7 +400,7 @@ where
     let init = op.init(acc.cname, acc.pos_inf, acc.neg_inf);
 
     // A mixed-dtype instantiation may need both types' includes; the same-dtype case is a no-op.
-    let mut includes: Vec<&'static str> = TIn::INCLUDES.iter().copied().collect();
+    let mut includes: Vec<&'static str> = TIn::INCLUDES.to_vec();
     for inc in TOut::INCLUDES.iter().copied() {
         if !includes.contains(&inc) {
             includes.push(inc);
@@ -422,6 +460,19 @@ mod tests {
     use super::super::reduce_plan::{classify_reduce, MAX_LANES};
     use super::*;
 
+    /// Every row of the table, so a new op cannot be added without the checks below seeing it.
+    const ALL_OPS: [UnaryOp; 9] = [
+        UnaryOp::Sum,
+        UnaryOp::Prod,
+        UnaryOp::Mean,
+        UnaryOp::L2Norm,
+        UnaryOp::Min,
+        UnaryOp::Max,
+        UnaryOp::All,
+        UnaryOp::Any,
+        UnaryOp::CountNonZero,
+    ];
+
     fn layout(shape: &[usize], stride: &[isize], offset: usize) -> Layout<IxD> {
         Layout::<IxD>::new(shape.to_vec().into(), stride.to_vec().into(), offset).unwrap()
     }
@@ -430,14 +481,7 @@ mod tests {
     /// NVRTC error at runtime — on a rented GPU, not in `cargo test`.
     #[test]
     fn op_table_is_well_formed() {
-        for op in [
-            UnaryOp::Sum,
-            UnaryOp::Prod,
-            UnaryOp::Mean,
-            UnaryOp::L2Norm,
-            UnaryOp::Min,
-            UnaryOp::Max,
-        ] {
+        for op in ALL_OPS {
             let init = op.init("double", "POSINF", "NEGINF");
             assert!(!init.is_empty(), "{:?}: empty init", op);
             // `fold` and `comb` must consume both macro parameters, or the C macro fails to expand.
@@ -445,14 +489,69 @@ mod tests {
             assert!(op.fold().contains("(X)"), "{:?}: fold must use the element", op);
             assert!(op.comb().contains("(A)") && op.comb().contains("(B)"), "{:?}: comb", op);
             assert!(op.post().contains("(V)"), "{:?}: post must use the accumulator", op);
-            // The fold's element must be cast to the accumulator type; relying on C++ promotion
-            // would round to the wider type first and narrow on assignment.
+            assert!(!op.name().contains('@'), "{:?}: unresolved token in the name", op);
+        }
+
+        // The rows that sum the element itself must cast it to the accumulator; relying on C++
+        // promotion would round to the wider type first and narrow on assignment. `count_nonzero`
+        // is excluded on purpose: its cast wraps the predicate, not the element.
+        for op in [UnaryOp::Sum, UnaryOp::Prod, UnaryOp::Mean, UnaryOp::L2Norm, UnaryOp::Min, UnaryOp::Max] {
             assert!(
                 op.fold().contains("(@TACC@)(X)"),
                 "{:?}: fold must cast the element to the accumulator",
                 op
             );
-            assert!(!op.name().contains('@'), "{:?}: unresolved token in the name", op);
+        }
+    }
+
+    /// Every token that appears in the template or in a table row must have a substitution, and the
+    /// rows that expand *into* other tokens must be substituted first. Both checks are cheap here and
+    /// expensive on a rented GPU: an unsubstituted token reaches NVRTC and fails at launch time, not
+    /// at `cargo test` time.
+    #[test]
+    fn every_token_is_substituted_in_the_right_order() {
+        fn tokens(text: &str) -> Vec<&str> {
+            let bytes = text.as_bytes();
+            let mut out = vec![];
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'@' {
+                    if let Some(j) = text[i + 1..].find('@') {
+                        out.push(&text[i..i + j + 2]);
+                        i += j + 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            out
+        }
+
+        // The substitution list, in the order the launcher applies it. Kept in one place so the
+        // ordering assertion below is about the real order, not a copy of it.
+        let order = [
+            "@PREAMBLE@", "@NAME@", "@FOLD@", "@COMB@", "@POST@", "@INIT@", "@TIN@", "@TACC@",
+            "@TOUT@", "@LANES@", "@LOG2_LANES@", "@OPB@", "@MAXW@",
+        ];
+
+        for op in ALL_OPS {
+            for text in [op.fold(), op.comb(), op.post(), op.preamble()] {
+                for t in tokens(text) {
+                    assert!(order.contains(&t), "{op:?}: {t} has no substitution");
+                }
+            }
+        }
+        for t in tokens(REDUCE_UNARY_ENTRY) {
+            assert!(order.contains(&t), "template uses {t}, which is not substituted");
+        }
+
+        // A token whose replacement text contains another token must come first.
+        for producer in ["@FOLD@", "@COMB@", "@POST@"] {
+            for consumer in ["@TIN@", "@TACC@", "@TOUT@"] {
+                let (p, c) = (order.iter().position(|t| *t == producer).unwrap(),
+                              order.iter().position(|t| *t == consumer).unwrap());
+                assert!(p < c, "{producer} must be substituted before {consumer}");
+            }
         }
     }
 

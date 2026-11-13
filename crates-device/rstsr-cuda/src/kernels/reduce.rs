@@ -218,7 +218,7 @@ where
     }
 
     let opb = outputs_per_block as usize;
-    let grid_blocks = (n_out + opb - 1) / opb;
+    let grid_blocks = n_out.div_ceil(opb);
     // one block per output tile: the grid is a u32 in the driver API
     if grid_blocks > u32::MAX as usize {
         rstsr_raise!(UnImplemented, "cuda vecdot: grid exceeds u32")?;

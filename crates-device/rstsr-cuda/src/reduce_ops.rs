@@ -12,6 +12,10 @@
 //! | `OpSumDtypeAPI` | `Sum` | `TOut` | `0` | `f32 → f64`, `i32 → f64` accumulate |
 //! | `OpProdDtypeAPI` | `Prod` | `TOut` | `1` | |
 //! | `OpMeanDtypeAPI` | `Mean` | `TOut` | NaN | |
+//! | `OpAllAPI` | `All` | `int` | `1` | `bool` in, `bool` out |
+//! | `OpAnyAPI` | `Any` | `int` | `0` | `bool` in, `bool` out |
+//! | `OpCountNonZeroAPI` | `CountNonZero` | `u64` | `0` | `usize` out; real dtypes |
+//! | `OpSumBoolAPI` | `CountNonZero` | `u64` | `0` | `bool` in, `usize` out |
 //!
 //! This is a sibling module to `operators.rs` rather than a block inside it: the nine impls, their
 //! two helpers and their generic bounds are ~350 lines of one subject, and they are the only thing in
@@ -30,9 +34,6 @@
 //!   `(value, index)` and comparing lexicographically, but "first" is first in the CPU's traversal
 //!   order, and `block_step` deliberately allows the contracted axes in any order — so the tie-break
 //!   would silently depend on memory layout. Needs a decision, not code.
-//! - **`OpAllAPI`, `OpAnyAPI`, `OpCountNonZeroAPI`, `OpSumBoolAPI`**: `TOut` is `bool`/`usize`. Both
-//!   are plausible `CudaDType`s (`rt::lt` already yields `CudaBuffer<bool>`), but neither is confirmed,
-//!   and a wrong guess is a compile error in the impl header rather than at the call site.
 //! - **`OpCumSumAPI`, `OpCumProdAPI`** (+ dtype variants): a *scan*, not a reduction. Different
 //!   algorithm, different kernel, and the plan does not describe it.
 //! - **`OpAllCloseAPI`**: `allclose_axes` is `unimplemented!()` on the CPU too.
@@ -42,6 +43,7 @@
 
 use core::mem::MaybeUninit;
 
+use crate::dtype::CudaReal;
 use crate::kernels::reduce_plan::classify_reduce;
 use crate::kernels::reduce_unary::{reduce_unary_launch, AccSpec, ReduceAcc, UnaryOp};
 use crate::prelude_dev::*;
@@ -379,5 +381,134 @@ where
         axes: &[isize],
     ) -> Result<(Storage<DataOwned<<Self as DeviceRawAPI<TOut>>::Raw>, TOut, Self>, Layout<IxD>)> {
         reduce_axes_impl(self, UnaryOp::Mean, TOut::SPEC, a, &la.to_dim::<IxD>()?, axes, TOut::nan())
+    }
+}
+
+// --- predicates and counts ----------------------------------------------------------------------
+//
+// `all`/`any` accumulate in `int` and `count_nonzero` in `unsigned long long`, so these are the rows
+// whose `AccSpec` is a constant rather than the operand's own type. The tree code is unchanged: only
+// the fold differs, and it differs by a cast that the element type does not participate in.
+
+impl<D> OpAllAPI<bool, D> for DeviceCuda
+where
+    Self: DeviceRawAPI<bool, Raw = CudaBuffer<bool>>
+        + DeviceRawAPI<MaybeUninit<bool>, Raw = CudaBuffer<MaybeUninit<bool>>>
+        + DeviceCreationAnyAPI<bool>
+        + DeviceToCpuAPI<bool>,
+    D: DimAPI,
+{
+    type TOut = bool;
+
+    fn all_all(&self, a: &CudaBuffer<bool>, la: &Layout<D>) -> Result<bool> {
+        // `all([]) == true`: the identity doubles as the empty-input fill, exactly as on the CPU.
+        reduce_all_impl(self, UnaryOp::All, AccSpec::INT, a, &la.to_dim::<IxD>()?, true)
+    }
+
+    fn all_axes(
+        &self,
+        a: &CudaBuffer<bool>,
+        la: &Layout<D>,
+        axes: &[isize],
+    ) -> Result<
+        (Storage<DataOwned<<Self as DeviceRawAPI<Self::TOut>>::Raw>, Self::TOut, Self>, Layout<IxD>),
+    > {
+        reduce_axes_impl(self, UnaryOp::All, AccSpec::INT, a, &la.to_dim::<IxD>()?, axes, true)
+    }
+}
+
+impl<D> OpAnyAPI<bool, D> for DeviceCuda
+where
+    Self: DeviceRawAPI<bool, Raw = CudaBuffer<bool>>
+        + DeviceRawAPI<MaybeUninit<bool>, Raw = CudaBuffer<MaybeUninit<bool>>>
+        + DeviceCreationAnyAPI<bool>
+        + DeviceToCpuAPI<bool>,
+    D: DimAPI,
+{
+    type TOut = bool;
+
+    fn any_all(&self, a: &CudaBuffer<bool>, la: &Layout<D>) -> Result<bool> {
+        reduce_all_impl(self, UnaryOp::Any, AccSpec::INT, a, &la.to_dim::<IxD>()?, false)
+    }
+
+    fn any_axes(
+        &self,
+        a: &CudaBuffer<bool>,
+        la: &Layout<D>,
+        axes: &[isize],
+    ) -> Result<
+        (Storage<DataOwned<<Self as DeviceRawAPI<Self::TOut>>::Raw>, Self::TOut, Self>, Layout<IxD>),
+    > {
+        reduce_axes_impl(self, UnaryOp::Any, AccSpec::INT, a, &la.to_dim::<IxD>()?, axes, false)
+    }
+}
+
+impl<T, D> OpCountNonZeroAPI<T, D> for DeviceCuda
+where
+    Self: DeviceRawAPI<T, Raw = CudaBuffer<T>>
+        + DeviceRawAPI<MaybeUninit<usize>, Raw = CudaBuffer<MaybeUninit<usize>>>
+        + DeviceCreationAnyAPI<usize>
+        + DeviceToCpuAPI<usize>,
+    // `CudaReal` is ints and floats: the fold compares the element against zero, which a complex
+    // struct cannot do with the same expression.
+    T: CudaDType + CudaReal,
+    D: DimAPI,
+{
+    type TOut = usize;
+
+    fn count_nonzero_all(&self, a: &CudaBuffer<T>, la: &Layout<D>) -> Result<usize> {
+        reduce_all_impl(self, UnaryOp::CountNonZero, AccSpec::U64, a, &la.to_dim::<IxD>()?, 0usize)
+    }
+
+    fn count_nonzero_axes(
+        &self,
+        a: &CudaBuffer<T>,
+        la: &Layout<D>,
+        axes: &[isize],
+    ) -> Result<
+        (Storage<DataOwned<<Self as DeviceRawAPI<Self::TOut>>::Raw>, Self::TOut, Self>, Layout<IxD>),
+    > {
+        reduce_axes_impl(
+            self,
+            UnaryOp::CountNonZero,
+            AccSpec::U64,
+            a,
+            &la.to_dim::<IxD>()?,
+            axes,
+            0usize,
+        )
+    }
+}
+
+impl<D> OpSumBoolAPI<D> for DeviceCuda
+where
+    Self: DeviceRawAPI<bool, Raw = CudaBuffer<bool>>
+        + DeviceRawAPI<MaybeUninit<usize>, Raw = CudaBuffer<MaybeUninit<usize>>>
+        + DeviceCreationAnyAPI<usize>
+        + DeviceToCpuAPI<usize>,
+    D: DimAPI,
+{
+    fn sum_all(&self, a: &CudaBuffer<bool>, la: &Layout<D>) -> Result<usize> {
+        // Same row as `count_nonzero`: for a `bool`, "nonzero" is "true".
+        reduce_all_impl(self, UnaryOp::CountNonZero, AccSpec::U64, a, &la.to_dim::<IxD>()?, 0usize)
+    }
+
+    fn sum_axes(
+        &self,
+        a: &CudaBuffer<bool>,
+        la: &Layout<D>,
+        axes: &[isize],
+    ) -> Result<
+        (Storage<DataOwned<<Self as DeviceRawAPI<usize>>::Raw>, usize, Self>, Layout<IxD>),
+    > {
+        reduce_axes_impl(
+            self,
+            UnaryOp::CountNonZero,
+            AccSpec::U64,
+            a,
+            &la.to_dim::<IxD>()?,
+            axes,
+            0usize,
+        )
     }
 }

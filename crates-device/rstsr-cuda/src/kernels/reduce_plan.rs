@@ -112,7 +112,7 @@ impl ReducePlan {
     /// Blocks to launch.
     pub(crate) fn grid_blocks(&self) -> usize {
         let opb = self.outputs_per_block as usize;
-        (self.n_out + opb - 1) / opb
+        self.n_out.div_ceil(opb)
     }
 }
 
@@ -214,7 +214,7 @@ pub(crate) fn classify_reduce(
 
     // The output must be walkable as `c[j]`: a row-major block whose innermost step is 1. A rank-0
     // output is the single-element case and needs no step at all.
-    let c_ok = if lc.ndim() == 0 { n_out == 1 } else { output_step(&lc) == Some(1) };
+    let c_ok = if lc.ndim() == 0 { n_out == 1 } else { output_step(lc) == Some(1) };
     if !c_ok {
         rstsr_raise!(
             InvalidLayout,
