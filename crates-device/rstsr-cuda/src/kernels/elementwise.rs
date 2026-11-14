@@ -130,6 +130,69 @@ extern "C" __global__ void rstsr_binary_f(
 }
 "#;
 
+/// Cross product over one size-3 axis: four reads, three writes per visited slot.
+///
+/// Its own entry rather than a `binary_launch` expression because the body is not one value per
+/// operand — it reads `a` and `b` at the axis offsets +1 and +2 and writes all three output
+/// components. The iteration is the same plan machinery: the size-3 axis is collapsed to shape 1 /
+/// stride 0, so one visited slot is one vector, and the three components are reached by the axis
+/// strides that the launcher passes separately.
+const CROSS_ENTRIES: &str = r#"
+__device__ __forceinline__ void rstsr_cross3(
+    @TO@* cv, const @TA@* av, const @TB@* bv,
+    rstsr_isz sa, rstsr_isz sb, rstsr_isz sc)
+{
+    // the cyclic formula, with 0 * s == 0 so a broadcast (stride 0) operand reads one element
+    cv[0 * sc] = (av[1 * sa] * bv[2 * sb]) - (av[2 * sa] * bv[1 * sb]);
+    cv[1 * sc] = (av[2 * sa] * bv[0 * sb]) - (av[0 * sa] * bv[2 * sb]);
+    cv[2 * sc] = (av[0 * sa] * bv[1 * sb]) - (av[1 * sa] * bv[0 * sb]);
+}
+
+extern "C" __global__ void rstsr_cross_p(
+    @TO@* out, rstsr_plan op,
+    const @TA@* a, rstsr_plan ap,
+    const @TB@* b, rstsr_plan bp,
+    rstsr_usz n, rstsr_isz sa, rstsr_isz sb, rstsr_isz sc)
+{
+    rstsr_usz lin = (rstsr_usz)blockIdx.x * (rstsr_usz)blockDim.x + (rstsr_usz)threadIdx.x;
+    if (lin >= n) return;
+    rstsr_usz oo = rstsr_plan_offset(lin, op, 0);
+    rstsr_usz ia = rstsr_plan_offset(lin, ap, 0);
+    rstsr_usz ib = rstsr_plan_offset(lin, bp, 0);
+    rstsr_cross3(out + (rstsr_isz)oo, a + (rstsr_isz)ia, b + (rstsr_isz)ib, sa, sb, sc);
+}
+
+extern "C" __global__ void rstsr_cross_pn(
+    @TO@* out, rstsr_plan_n op,
+    const @TA@* a, rstsr_plan_n ap,
+    const @TB@* b, rstsr_plan_n bp,
+    int n, rstsr_isz sa, rstsr_isz sb, rstsr_isz sc)
+{
+    int lin = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    int w = gridDim.x * blockDim.x;
+    for (int rep = 0; rep < 4; ++rep) {
+        if (lin < n) {
+            rstsr_isz oo = rstsr_plan_offset_n(lin, op);
+            rstsr_isz ia = rstsr_plan_offset_n(lin, ap);
+            rstsr_isz ib = rstsr_plan_offset_n(lin, bp);
+            rstsr_cross3(out + oo, a + ia, b + ib, sa, sb, sc);
+        }
+        lin += w;
+    }
+}
+
+extern "C" __global__ void rstsr_cross_f(
+    @TO@* out, const @TA@* a, const @TB@* b,
+    rstsr_usz n, rstsr_isz sa, rstsr_isz sb, rstsr_isz sc)
+{
+    rstsr_usz g = (rstsr_usz)blockIdx.x * (rstsr_usz)blockDim.x + (rstsr_usz)threadIdx.x;
+    rstsr_usz w = (rstsr_usz)gridDim.x * (rstsr_usz)blockDim.x;
+    #define RSTSR_CSTEP(I) { rstsr_usz oo = g + (I) * w; if (oo < n) { rstsr_cross3(out + (rstsr_isz)oo, a + (rstsr_isz)oo, b + (rstsr_isz)oo, sa, sb, sc); } }
+    RSTSR_CSTEP(0) RSTSR_CSTEP(1) RSTSR_CSTEP(2) RSTSR_CSTEP(3)
+    #undef RSTSR_CSTEP
+}
+"#;
+
 const UNARY_ENTRIES: &str = r#"
 extern "C" __global__ void rstsr_unary_p(
     @TO@* out, rstsr_plan op,
@@ -444,6 +507,131 @@ where
     }
     launch.launch()?;
     // write ordering for an output buffer not allocated on this stream
+    let _go = crate::kernel::order_output(c, exec)?;
+    Ok(())
+}
+
+/// Collapse `axis` to shape 1 / stride 0: one visited slot becomes one vector, and the three
+/// components are then reached by the axis stride the caller captured beforehand.
+fn collapse_axis<D: DimAPI>(l: &Layout<D>, axis: usize) -> Result<Layout<D>> {
+    let mut shape = l.shape().clone();
+    let mut stride = l.stride().clone();
+    shape[axis] = 1;
+    stride[axis] = 0;
+    Layout::new(shape, stride, l.offset())
+}
+
+/// Planned cross-product launch over one size-3 `axis`.
+///
+/// Refuses the rank-generic plan walk for now: that path needs a four-input, three-output generic
+/// kernel of its own, and the shapes that reach it (very high rank or offsets past 32 bits) are not
+/// what `cross` is used for. A named error beats a silently wrong answer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cross_launch<TOUT, TA, TB>(
+    device: &DeviceCuda,
+    c: &mut CudaBuffer<MaybeUninit<TOUT>>,
+    lc: &Layout<impl DimAPI>,
+    a: &CudaBuffer<TA>,
+    la: &Layout<impl DimAPI>,
+    b: &CudaBuffer<TB>,
+    lb: &Layout<impl DimAPI>,
+    axis: usize,
+) -> Result<()>
+where
+    TOUT: CudaDType,
+    TA: CudaDType,
+    TB: CudaDType,
+{
+    // read the axis strides before collapsing: these are what select the three components
+    let (sa, sb, sc) = (la.stride()[axis], lb.stride()[axis], lc.stride()[axis]);
+    let lcc = collapse_axis(lc, axis)?;
+    let lac = collapse_axis(la, axis)?;
+    let lbc = collapse_axis(lb, axis)?;
+
+    let n = lcc.size();
+    if n == 0 {
+        return Ok(());
+    }
+
+    let order = device.default_order();
+    let po = plan_operand(&lcc, order, n);
+    let pa = plan_operand(&lac, order, n);
+    let pb = plan_operand(&lbc, order, n);
+    if po.is_generic() || pa.is_generic() || pb.is_generic() {
+        rstsr_raise!(
+            UnImplemented,
+            "cuda cross: an operand needs the rank-generic plan walk, which this kernel does not have"
+        )?;
+    }
+
+    let exec = device.stream();
+    let _ga = order_input(a, exec)?;
+    let _gb = order_input(b, exec)?;
+
+    let variant = plan_variant(&[&po, &pa, &pb]);
+    let entry = match variant {
+        PlanVariant::Flat => "rstsr_cross_f",
+        PlanVariant::Narrow => "rstsr_cross_pn",
+        PlanVariant::Wide => "rstsr_cross_p",
+    };
+    let includes = [TA::INCLUDES, TB::INCLUDES, TOUT::INCLUDES].concat();
+    let subs = [("@TO@", TOUT::CNAME), ("@TA@", TA::CNAME), ("@TB@", TB::CNAME)];
+    let f = planned_function(device, entry, &includes, &subs_disc(&subs), || {
+        render(CROSS_ENTRIES, &subs)
+    })?;
+
+    // SAFETY: `MaybeUninit<TOUT>` and `TOUT` are layout-identical; the kernel writes all three
+    // components of every visited slot, and `lc` holds exactly those slots.
+    let c_typed: &mut CudaBuffer<TOUT> =
+        unsafe { &mut *(c as *mut CudaBuffer<MaybeUninit<TOUT>> as *mut CudaBuffer<TOUT>) };
+
+    let mut launch = FlatLaunch::new(exec, &f, n);
+    match variant {
+        PlanVariant::Flat => {
+            launch = launch
+                .elems_per_thread(4)
+                .arg_u64(offset_ptr(exec, c_typed, lc.offset()))
+                .arg_u64(offset_ptr(exec, a, la.offset()))
+                .arg_u64(offset_ptr(exec, b, lb.offset()))
+                .arg_usize(n)
+                .arg_bytes(&sa.to_ne_bytes())
+                .arg_bytes(&sb.to_ne_bytes())
+                .arg_bytes(&sc.to_ne_bytes());
+        },
+        PlanVariant::Narrow => {
+            let zn = PlanBytesN::zeroed();
+            let (nop, nap, nbp) = (plan_bytes_n(&po), plan_bytes_n(&pa), plan_bytes_n(&pb));
+            launch = launch
+                .elems_per_thread(4)
+                .arg_u64(offset_ptr(exec, c_typed, lc.offset()))
+                .arg_bytes(nop.as_ref().unwrap_or(&zn).bytes())
+                .arg_u64(offset_ptr(exec, a, la.offset()))
+                .arg_bytes(nap.as_ref().unwrap_or(&zn).bytes())
+                .arg_u64(offset_ptr(exec, b, lb.offset()))
+                .arg_bytes(nbp.as_ref().unwrap_or(&zn).bytes())
+                .arg_i32(n as i32)
+                .arg_bytes(&sa.to_ne_bytes())
+                .arg_bytes(&sb.to_ne_bytes())
+                .arg_bytes(&sc.to_ne_bytes());
+        },
+        PlanVariant::Wide => {
+            let zero = PlanBytes::zeroed();
+            let (bop, bap, bbp) = (plan_bytes(&po), plan_bytes(&pa), plan_bytes(&pb));
+            launch = launch
+                .arg_u64(offset_ptr(exec, c_typed, lc.offset()))
+                .arg_bytes(bop.as_ref().unwrap_or(&zero).bytes())
+                .arg_u64(offset_ptr(exec, a, la.offset()))
+                .arg_bytes(bap.as_ref().unwrap_or(&zero).bytes())
+                .arg_u64(offset_ptr(exec, b, lb.offset()))
+                .arg_bytes(bbp.as_ref().unwrap_or(&zero).bytes())
+                .arg_usize(n)
+                .arg_bytes(&sa.to_ne_bytes())
+                .arg_bytes(&sb.to_ne_bytes())
+                .arg_bytes(&sc.to_ne_bytes());
+        },
+    }
+    launch.launch()?;
+
     let _go = crate::kernel::order_output(c, exec)?;
     Ok(())
 }

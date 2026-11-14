@@ -965,3 +965,94 @@ fn reduce_dtype_accumulator() {
 }
 
 /* #endregion */
+
+/* #region outer + cross */
+
+/// `outer` reuses the planned binary launcher with the operands widened onto `(n, m)`; the only new
+/// thing is the zero stride on the axis each operand does not own. Strided and offset views are the
+/// cases that would break if the widening dropped the operand's own stride or offset.
+#[test]
+fn outer_vs_cpu() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let a: Tensor<f64, _, _> = rt::arange((0., 5., 1., &d));
+    let b: Tensor<f64, _, _> = rt::arange((10., 13., 1., &d));
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::arange((0., 5., 1., &dcpu));
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::arange((10., 13., 1., &dcpu));
+
+    assert_eq!(host_nd(&rt::outer(&a, &b)), host_nd(&rt::outer(&a_cpu, &b_cpu)), "dense");
+
+    // offset view: a[1..]
+    assert_eq!(
+        host_nd(&rt::outer(a.i(1..), &b)),
+        host_nd(&rt::outer(a_cpu.i(1..), &b_cpu)),
+        "offset operand"
+    );
+
+    // negative-stride view: a[::-2]
+    let rev = SliceI::new(None::<isize>, None::<isize>, Some(-2isize));
+    assert_eq!(
+        host_nd(&rt::outer(a.i(rev), &b)),
+        host_nd(&rt::outer(a_cpu.i(rev), &b_cpu)),
+        "negative-stride operand"
+    );
+
+    // into an existing output: the tier transmutes it into the write-only slot
+    // `outer_from` wants a fixed-rank `Ix2` output; `into_shape` yields `IxD`, so narrow it
+    let mut c: Tensor<f64, DeviceCuda, Ix2> = rt::zeros(([15usize], &d)).into_shape([5, 3]).into_dim::<Ix2>();
+    let mut c_cpu: Tensor<f64, DeviceCpuSerial, Ix2> =
+        rt::zeros(([15usize], &dcpu)).into_shape([5, 3]).into_dim::<Ix2>();
+    rt::outer_from(&mut c, &a, &b);
+    rt::outer_from(&mut c_cpu, &a_cpu, &b_cpu);
+    assert_eq!(host_nd(&c), host_nd(&c_cpu), "outer_from");
+}
+
+/// `cross` has its own kernel (four reads, three writes per slot). The four cases pin the parts that
+/// a one-value-per-operand template could not have handled: the cyclic component order, a broadcast
+/// operand (stride 0 along the size-3 axis), a non-last axis, and a negative `axis`.
+#[test]
+fn cross_vs_cpu() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+
+    let a: Tensor<f64, _, _> = rt::arange((0., 12., 1., &d)).into_shape([4, 3]);
+    let b: Tensor<f64, _, _> = rt::arange((1., 13., 1., &d)).into_shape([4, 3]);
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::arange((0., 12., 1., &dcpu)).into_shape([4, 3]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::arange((1., 13., 1., &dcpu)).into_shape([4, 3]);
+
+    // last axis, named and negative
+    assert_eq!(host_nd(&rt::cross(&a, &b, 1)), host_nd(&rt::cross(&a_cpu, &b_cpu, 1)), "axis 1");
+    assert_eq!(host_nd(&rt::cross(&a, &b, -1)), host_nd(&rt::cross(&a_cpu, &b_cpu, -1)), "axis -1");
+
+    // a × a == 0
+    let z = host_nd(&rt::cross(&a, &a, 1));
+    assert!(z.iter().all(|v| *v == 0.0), "a × a must vanish, got {z:?}");
+
+    // broadcast: a single vector against a stack — stride 0 along the cross axis for `b`
+    let v: Tensor<f64, _, _> = rt::arange((1., 4., 1., &d));
+    let v_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::arange((1., 4., 1., &dcpu));
+    assert_eq!(
+        host_nd(&rt::cross(&a, &v, 1)),
+        host_nd(&rt::cross(&a_cpu, &v_cpu, 1)),
+        "broadcast operand"
+    );
+
+    // a middle axis of a rank-3 tensor, and a strided (non-contiguous) stack
+    let a3: Tensor<f64, _, _> = rt::arange((0., 24., 1., &d)).into_shape([2, 3, 4]);
+    let b3: Tensor<f64, _, _> = rt::arange((1., 25., 1., &d)).into_shape([2, 3, 4]);
+    let a3_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::arange((0., 24., 1., &dcpu)).into_shape([2, 3, 4]);
+    let b3_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::arange((1., 25., 1., &dcpu)).into_shape([2, 3, 4]);
+    assert_eq!(host_nd(&rt::cross(&a3, &b3, 1)), host_nd(&rt::cross(&a3_cpu, &b3_cpu, 1)), "axis 1 of [2,3,4]");
+
+    // every other row of the stack: the collapsed plan is then strided, not flat
+    let step = SliceI::new(None::<isize>, None::<isize>, Some(2isize));
+    assert_eq!(
+        host_nd(&rt::cross(a.i(step), b.i(step), 1)),
+        host_nd(&rt::cross(a_cpu.i(step), b_cpu.i(step), 1)),
+        "strided stack"
+    );
+}
+
+/* #endregion */

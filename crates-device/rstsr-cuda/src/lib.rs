@@ -41,6 +41,7 @@ pub mod error;
 pub mod flags;
 pub mod format;
 pub mod kernel;
+pub mod linalg;
 pub(crate) mod kernels;
 
 pub(crate) mod kernels_ops;
