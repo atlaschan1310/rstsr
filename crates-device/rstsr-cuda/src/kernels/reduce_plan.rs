@@ -542,6 +542,26 @@ mod tests {
         assert!(msg.contains("InvalidLayout"), "got: {msg}");
     }
 
+    /// The strided sibling of [`multi_axis_output_is_one_run`], and the shape behind
+    /// `vecdot_multi_axis_output_vs_cpu`. Contracting the **last** axis of a rank-3 tensor leaves a
+    /// two-axis output part whose step is 8, not 1 — the case the first classifier refused outright
+    /// ("not a single axis") and this one plans by putting the lanes on the contraction instead of on
+    /// thread-per-output.
+    ///
+    /// Pinned here so that narrowing the classifier again fails in `cargo test --lib`, where that
+    /// refusal used to be asserted only on a machine with a GPU.
+    #[test]
+    fn strided_multi_axis_output_is_planned() {
+        let la = layout(&[4, 8, 8], &[64, 8, 1], 0);
+        let lc = layout(&[4, 8], &[8, 1], 0);
+        let plan = classify_reduce(&la, &la, &lc, &[2], &[2], RowMajor).unwrap();
+        assert_eq!(plan.n_contract, 8);
+        assert_eq!(plan.n_out, 32);
+        assert_eq!(plan.step_a, 1, "contracted axis is unit-stride");
+        assert_eq!(plan.out_step_a, 8, "two-axis output, innermost step 8");
+        assert_eq!(geometry(plan), (8, 32, 1), "8 lanes fill the contraction, 32 outputs, one block");
+    }
+
     /// Short contractions shrink `lanes` instead of falling out of the plan.
     #[test]
     fn short_contraction_shrinks_lanes() {

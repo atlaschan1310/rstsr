@@ -660,18 +660,40 @@ fn vecdot_refuses_unplannable_shapes() {
         },
     }
 
-    // Rank-3 contracted on the last axis: the output part is two axes, which one `out_step` cannot
-    // describe. This is missing capability, not a layout defect, and it is reported as such.
-    let a3: Tensor<f64, _, _> = rt::arange((0., 4. * 8. * 8., 1., &d)).into_shape([4, 8, 8]);
-    let b3: Tensor<f64, _, _> =
-        rt::arange((1., (4. * 8. * 8.) + 1., 1., &d)).into_shape([4, 8, 8]);
-    match rt::vecdot_f(&a3, &b3, 2) {
-        Ok(_) => panic!("multi-axis output should be refused, but it computed a result"),
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(msg.contains("not a single axis"), "expected the axis reason, got: {msg}");
-        },
-    }
+    // The second case this test used to assert — a rank-3 contraction leaving a two-axis output —
+    // is no longer refused. `output_step` accepts any row-major run in shape order, not just a
+    // single axis, so it is now planned and computed; `vecdot_multi_axis_output_vs_cpu` checks the
+    // answer instead. The two refusals that remain reachable through `rt::vecdot_f` are this one and
+    // a gapped contracted block, and `reduce_plan::tests` pins both on the host, so a classifier
+    // change fails in `cargo test --lib` rather than only on a machine with a GPU.
+}
+
+/// Contracting the last axis of a rank-3 tensor leaves a **two-axis** output part.
+///
+/// This was refused by the first classifier, which required the output side to be a single axis, and
+/// that refusal was asserted in `vecdot_refuses_unplannable_shapes` until it quietly stopped being
+/// true. It is now supported: `[4, 8]` with strides `[64, 8]` is one arithmetic progression with
+/// step 8, so the kernel's `j * out_step` covers it. `reduce_plan::tests::multi_axis_output_is_planned`
+/// pins the same shape on the host.
+#[test]
+fn vecdot_multi_axis_output_vs_cpu() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+
+    // Exact data, so any summation order agrees and the comparison stays an assert_eq!.
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(4 * 8 * 8, 21), &dcpu)).into_shape([4, 8, 8]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(4 * 8 * 8, 22), &dcpu)).into_shape([4, 8, 8]);
+    let a = a_cpu.to_device(&d);
+    let b = b_cpu.to_device(&d);
+
+    // Output is rank 2 here, so `host_nd` rather than `host_vec1`.
+    let got = host_nd(&rt::vecdot(&a, &b, 2));
+    let want = host_nd(&rt::vecdot(&a_cpu, &b_cpu, 2));
+    assert_eq!(got.len(), 32, "(4, 8, 8) contracted on axis 2 leaves 4 * 8 outputs");
+    assert_eq!(got, want, "rank-3 input with a two-axis output part");
 }
 
 
