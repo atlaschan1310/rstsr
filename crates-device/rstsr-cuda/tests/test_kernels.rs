@@ -1078,3 +1078,218 @@ fn cross_vs_cpu() {
 }
 
 /* #endregion */
+
+/* #region matmul */
+
+/// One operand on both devices.
+type F64Pair = (Tensor<f64, DeviceCuda, IxD>, Tensor<f64, DeviceCpuSerial, IxD>);
+
+/// Integer-valued `[m, k]` and `[k, n]` on both devices, so every product and every partial sum is
+/// exact and the comparison stays an `assert_eq!`.
+fn matmul_pair(m: usize, k: usize, n: usize, seed: u64) -> (F64Pair, F64Pair) {
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(m * k, seed), &dcpu)).into_shape([m, k]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(k * n, seed ^ 0x5bf0_3635), &dcpu)).into_shape([k, n]);
+    ((a_cpu.to_device(&d), a_cpu), (b_cpu.to_device(&d), b_cpu))
+}
+
+/// Plain `[m, k] @ [k, n]`, including shapes that are not multiples of the 64x64 tile in any axis —
+/// those are what exercise the three clipping guards (A slab, B slab, epilogue).
+#[test]
+fn matmul_gemm22_vs_cpu() {
+    require_cuda!();
+    for &(m, k, n) in &[
+        (32usize, 32usize, 32usize),
+        (64, 64, 64),
+        (17, 33, 5),
+        (1, 8, 9),
+        (130, 70, 129),
+    ] {
+        let ((a, a_cpu), (b, b_cpu)) = matmul_pair(m, k, n, m as u64 * 7 + n as u64);
+        let got = host_nd(&rt::matmul(&a, &b));
+        let want = host_nd(&rt::matmul(&a_cpu, &b_cpu));
+        assert_eq!(got.len(), m * n, "({m} x {k}) @ ({k} x {n}) has {m}x{n} outputs");
+        assert_eq!(got, want, "({m} x {k}) @ ({k} x {n})");
+    }
+}
+
+/// The two non-default operand orientations, which select a different thread map each.
+///
+/// `a[m, k]` built from a `[k, m]` array has its `m` axis contiguous → the lanes follow `m`.
+/// `b[k, n]` built from `[n, k]` has its `k` axis contiguous → the lanes follow `k`. Both are plain
+/// views, so a transposed matmul costs no copy; that is the whole reason the lane map is a
+/// compile-time choice instead of a fixed axis.
+#[test]
+fn matmul_transposed_operands() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let (m, k, n) = (40usize, 24usize, 20usize);
+
+    // a^T-style left operand: [m, k] whose m axis is contiguous. `swapaxes` yields a view, which is
+    // the point — a transposed matmul must not require a copy on either side.
+    let a_base = rt::asarray((exact_data(k * m, 3), &dcpu)).into_shape([k, m]);
+    let at_cpu = a_base.swapaxes(0, 1);
+    // b^T-style right operand: [k, n] whose k axis is contiguous
+    let b_base = rt::asarray((exact_data(n * k, 4), &dcpu)).into_shape([n, k]);
+    let bt_cpu = b_base.swapaxes(0, 1);
+    let b0_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(k * n, 5), &dcpu)).into_shape([k, n]);
+    let a0_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(m * k, 6), &dcpu)).into_shape([m, k]);
+
+    let at = at_cpu.to_device(&d);
+    let bt = bt_cpu.to_device(&d);
+    let a0 = a0_cpu.to_device(&d);
+    let b0 = b0_cpu.to_device(&d);
+
+    assert_eq!(at.layout().stride()[0], 1, "fixture: the m axis must be the contiguous one");
+    assert_eq!(bt.layout().stride()[0], 1, "fixture: the k axis must be the contiguous one");
+
+    for (label, got, want) in [
+        ("a(m-contig) @ b", &rt::matmul(&at, &b0), &rt::matmul(&at_cpu, &b0_cpu)),
+        ("a @ b(k-contig)", &rt::matmul(&a0, &bt), &rt::matmul(&a0_cpu, &bt_cpu)),
+        ("a(m-contig) @ b(k-contig)", &rt::matmul(&at, &bt), &rt::matmul(&at_cpu, &bt_cpu)),
+    ] {
+        assert_eq!(host_nd(got), host_nd(want), "{label}");
+    }
+}
+
+/// Batched matmul: one `grid.z` slice per output matrix.
+#[test]
+fn matmul_batched_vs_cpu() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let (p, m, k, n) = (5usize, 12usize, 16usize, 8usize);
+
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(p * m * k, 11), &dcpu)).into_shape([p, m, k]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(p * k * n, 12), &dcpu)).into_shape([p, k, n]);
+    let a = a_cpu.to_device(&d);
+    let b = b_cpu.to_device(&d);
+
+    let got = host_nd(&rt::matmul(&a, &b));
+    assert_eq!(got.len(), p * m * n);
+    assert_eq!(got, host_nd(&rt::matmul(&a_cpu, &b_cpu)), "batched [p,m,k] @ [p,k,n]");
+
+    // broadcast batch: the left operand has no batch axis, so its batch stride is 0
+    let a2_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(m * k, 13), &dcpu)).into_shape([m, k]);
+    let a2 = a2_cpu.to_device(&d);
+    assert_eq!(
+        host_nd(&rt::matmul(&a2, &b)),
+        host_nd(&rt::matmul(&a2_cpu, &b_cpu)),
+        "broadcast batch: [m,k] @ [p,k,n]"
+    );
+}
+
+/// `matmul_from`: the `beta` path, which reads `c`. The opposite of `matmul_uninit`, whose buffer is
+/// `MaybeUninit` and must never be read — hence the two entry points.
+#[test]
+fn matmul_from_alpha_beta() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let (m, k, n) = (20usize, 12usize, 16usize);
+    let ((a, a_cpu), (b, b_cpu)) = matmul_pair(m, k, n, 21);
+
+    let mut c: Tensor<f64, _, _> = rt::full(([m * n], 1.0f64, &d)).into_shape([m, n]);
+    let mut c_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::full(([m * n], 1.0f64, &dcpu)).into_shape([m, n]);
+
+    rt::matmul_from(&mut c, &a, &b, 2.0f64, 3.0f64);
+    rt::matmul_from(&mut c_cpu, &a_cpu, &b_cpu, 2.0f64, 3.0f64);
+    assert_eq!(host_nd(&c), host_nd(&c_cpu), "c = 2*(a@b) + 3*c");
+
+    // beta = 0 must not read c: same answer from a NaN-filled buffer
+    let mut z: Tensor<f64, _, _> = rt::full(([m * n], f64::NAN, &d)).into_shape([m, n]);
+    let mut z_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::full(([m * n], f64::NAN, &dcpu)).into_shape([m, n]);
+    rt::matmul_from(&mut z, &a, &b, 1.0f64, 0.0f64);
+    rt::matmul_from(&mut z_cpu, &a_cpu, &b_cpu, 1.0f64, 0.0f64);
+    assert_eq!(host_nd(&z), host_nd(&z_cpu), "beta = 0 must ignore c's contents");
+    assert!(host_nd(&z).iter().all(|v| v.is_finite()), "NaN leaked in through beta = 0");
+}
+
+/// Rules 3 and 4 (GEMV / GEVM). Both go through the same kernel with a length-1 tile axis, because
+/// the layout module presents every rule as a 2-D matmul on its `_matmul` parts.
+#[test]
+fn matmul_gemv_gevm_vs_cpu() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let (m, k, n) = (24usize, 16usize, 18usize);
+
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(m * k, 31), &dcpu)).into_shape([m, k]);
+    let v_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::asarray((exact_data(k, 32), &dcpu));
+    let w_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::asarray((exact_data(k, 33), &dcpu));
+    let c_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(k * n, 34), &dcpu)).into_shape([k, n]);
+
+    let a = a_cpu.to_device(&d);
+    let v = v_cpu.to_device(&d);
+    let w = w_cpu.to_device(&d);
+    let c = c_cpu.to_device(&d);
+
+    // rule 4: [m, k] @ [k] -> [m]
+    assert_eq!(
+        host_vec1(&rt::matmul(&a, &v)),
+        host_vec1(&rt::matmul(&a_cpu, &v_cpu)),
+        "gemv: [m,k] @ [k]"
+    );
+    // rule 3: [k] @ [k, n] -> [n]
+    assert_eq!(
+        host_vec1(&rt::matmul(&w, &c)),
+        host_vec1(&rt::matmul(&w_cpu, &c_cpu)),
+        "gevm: [k] @ [k,n]"
+    );
+}
+
+/// The inner-dot rule is a reduction, not a GEMM, and is refused by name rather than run as a
+/// `1 x 1` tile of 256 redundant threads.
+#[test]
+fn matmul_inner_dot_is_refused_by_name() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let v: Tensor<f64, _, _> = rt::arange((0., 16., 1., &d));
+    match rt::matmul_f(&v, &v) {
+        Ok(_) => panic!("inner dot should be refused, but it computed a result"),
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(msg.contains("single-axis contraction"), "expected the reduction reason, got: {msg}");
+        },
+    }
+}
+
+/// `ColMajor`: the device reverses every layout and swaps the operands, per the identity in
+/// `rstsr_common::layout::matmul`. If that reversal is wrong the numbers come out transposed, which
+/// only a rectangular case can show.
+#[test]
+fn matmul_col_major_vs_cpu() {
+    require_cuda!();
+    let mut d = DeviceCuda::new(0);
+    d.set_default_order(ColMajor);
+    let mut dcpu = DeviceCpuSerial::default();
+    dcpu.set_default_order(ColMajor);
+    let (m, k, n) = (20usize, 12usize, 32usize);
+
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(m * k, 41), &dcpu)).into_shape([m, k]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(k * n, 42), &dcpu)).into_shape([k, n]);
+    let a = a_cpu.to_device(&d);
+    let b = b_cpu.to_device(&d);
+
+    let got = host_nd(&rt::matmul(&a, &b));
+    let want = host_nd(&rt::matmul(&a_cpu, &b_cpu));
+    assert_eq!(got.len(), m * n, "a transposed answer would have {k} elements");
+    assert_eq!(got, want, "col-major ({m} x {k}) @ ({k} x {n})");
+}
+
+/* #endregion */

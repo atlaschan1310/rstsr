@@ -405,7 +405,7 @@ fn subs_disc(subs: &[(&str, &str)]) -> String {
 /// Compile/fetch (interned) the entry `name` of a planned program.
 /// `disc_extra` must name every substitution the rendered source depends on;
 /// the source is assembled and NVRTC-compiled only on an intern miss.
-fn planned_function(
+pub(crate) fn planned_function(
     device: &DeviceCuda,
     name: &'static str,
     includes: &[&str],

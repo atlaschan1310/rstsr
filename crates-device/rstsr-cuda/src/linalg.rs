@@ -1,8 +1,7 @@
-//! `DeviceOuterAPI` and `DeviceCrossAPI` for `DeviceCuda`.
+//! `DeviceOuterAPI`, `DeviceCrossAPI` and `DeviceMatMulAPI` for `DeviceCuda`.
 //!
-//! Both are elementwise-shaped: the tensor tier has already resolved the axis, the broadcasting and
-//! the output layout, so the device work is "visit N slots, compute a small fixed formula". They
-//! differ in how much of the existing launcher they can reuse:
+//! Three very different amounts of work, and they sit in one file because the split is about *who
+//! owns the geometry*, not about the operator:
 //!
 //! - `outer` is a planned **binary** launch. The two 1-D operands are widened onto the `(n, m)`
 //!   output with a zero stride on the axis they do not own — the same trick the CPU implementation
@@ -10,9 +9,13 @@
 //! - `cross` reads four elements and writes three per slot (`a` and `b` at the axis offsets +1 and
 //!   +2), which no one-value-per-operand template can express, so it has its own entry:
 //!   [`elementwise::cross_launch`]. The iteration, the three plan variants and the cache are shared.
+//! - `matmul` is the only operation here whose *thread geometry* is the point: a tiled GEMM in
+//!   [`gemm`], where the block owns a tile of the output and the contraction streams through shared
+//!   memory. It is also the only one that needs the batch axes, which ride in `grid.z`.
 
-use crate::dtype::{CudaArith, CudaDType};
+use crate::dtype::{CudaArith, CudaDType, CudaReal};
 use crate::kernels::elementwise;
+use crate::kernels::gemm;
 use crate::prelude_dev::*;
 
 impl<TA, TB, TC> DeviceOuterAPI<TA, TB, TC> for DeviceCuda
@@ -74,5 +77,73 @@ where
         // `axis` is already a valid index into the (broadcast) output rank, and all three layouts
         // share one shape with `shape[axis] == 3` — the tier checked both.
         elementwise::cross_launch(self, c, lc, a, la, b, lb, axis)
+    }
+}
+
+impl<T, DA, DB, DC> DeviceMatMulAPI<T, T, T, DA, DB, DC> for DeviceCuda
+where
+    DA: DimAPI,
+    DB: DimAPI,
+    DC: DimAPI,
+    Self: DeviceRawAPI<T, Raw = CudaBuffer<T>>
+        + DeviceRawAPI<MaybeUninit<T>, Raw = CudaBuffer<MaybeUninit<T>>>,
+    // `num::Zero` is only used for the fresh-output path's `beta`, which the kernel then treats as
+    // "do not read c". It is not part of the arithmetic — that happens on the device.
+    //
+    // `CudaReal` keeps this impl off the complex dtypes, and that is deliberate, not an oversight:
+    // the kernel spells its zero as `(@T@)0`, which `rstsr_complex` has no single-argument
+    // constructor for, and `rstsr_complex.cuh` is spliced in only for the dtypes whose `INCLUDES`
+    // ask for it. A complex GEMM needs a zero that is a two-argument construction and a scalar
+    // multiply that the mixed-precision expression builders own — separate work, and better done
+    // with a measurement in hand than guessed at.
+    T: CudaDType + CudaReal + num::Zero,
+{
+    fn matmul(
+        &self,
+        c: &mut CudaBuffer<T>,
+        lc: &Layout<DC>,
+        a: &CudaBuffer<T>,
+        la: &Layout<DA>,
+        b: &CudaBuffer<T>,
+        lb: &Layout<DB>,
+        alpha: T,
+        beta: T,
+    ) -> Result<()> {
+        gemm::gemm_launch(
+            self,
+            c,
+            &lc.to_dim::<IxD>()?,
+            a,
+            &la.to_dim::<IxD>()?,
+            b,
+            &lb.to_dim::<IxD>()?,
+            alpha,
+            beta,
+        )
+    }
+
+    fn matmul_uninit(
+        &self,
+        c: &mut CudaBuffer<MaybeUninit<T>>,
+        lc: &Layout<DC>,
+        a: &CudaBuffer<T>,
+        la: &Layout<DA>,
+        b: &CudaBuffer<T>,
+        lb: &Layout<DB>,
+        alpha: T,
+    ) -> Result<()> {
+        // `beta = 0` is the whole of the "never read c" contract: the epilogue is guarded by
+        // `beta == 0`, so the `MaybeUninit` slots are written and not touched beforehand.
+        gemm::gemm_launch(
+            self,
+            c,
+            &lc.to_dim::<IxD>()?,
+            a,
+            &la.to_dim::<IxD>()?,
+            b,
+            &lb.to_dim::<IxD>()?,
+            alpha,
+            <T as num::Zero>::zero(),
+        )
     }
 }
