@@ -1,12 +1,28 @@
-//! Tiled GEMM behind `DeviceMatMulAPI` (and therefore `rt::matmul` / `matmul_from`).
+//! Tiled GEMM behind `DeviceMatMulAPI` — the **fallback** path, not the default.
 //!
+//! [`super::cublas_gemm`] runs first and handles every layout it can express; this kernel takes what
+//! is left: a stepped output, a reversed operand, a machine without `libcublas`. It is kept for
+//! those cases and as the test oracle for the cuBLAS path, not because it competes — on an A100,
+//! `dgemm` reaches the FP64 tensor-core pipe at 19.5 TFLOPS where a SIMT tile tops out at 9.7.
+//!
+//! `RSTSR_CUDA_MATMUL=tiled` forces this path, which is how `tests/test_matmul_tiled.rs` keeps it
+//! on hardware evidence now that cuBLAS is the default.
+//!
+//! What follows describes this kernel.
 //! # What this kernel is
 //!
 //! One block computes a `BM x BN` tile of `C = alpha * A B + beta * C` by streaming the contraction
 //! axis through shared memory in `BK`-deep slabs. Per block that is `BM*BN*K` fused multiply-adds
-//! for `(BM+BN)*K` loads, i.e. arithmetic intensity `BM*BN/(BM+BN) = 32` flops/byte once the tile is
-//! resident. The untiled form has intensity 1 and is DRAM-bound on every machine, which is the whole
-//! reason this file exists.
+//! for `(BM+BN)*K` element loads, i.e. `2*64*64 / (128*8) = 8` flop/byte once the tile is resident.
+//! The untiled form is `2/16 = 0.125`, which is DRAM-bound on every machine — the whole reason this
+//! file exists.
+//!
+//! 8 flop/byte is only just above the A100 fp64 ridge point (`9.7 TFLOPS / 1.55 TB/s` = 6.3), so at
+//! this tile size the kernel is *marginally* compute-bound and the memory system still costs nearly
+//! as much as the arithmetic. Doubling the tile to 128x128 gives `2*128*128 / (256*8) = 16` and is
+//! the first thing to try after measuring this one; `BM`/`BN` are plain constants and every derived
+//! count (slab depth, thread count, shared sizes) follows from them, so the change is a re-tune
+//! rather than a rewrite.
 //!
 //! # The two things that are actually decisions
 //!
@@ -48,8 +64,8 @@
 
 use std::sync::Arc;
 
-use crate::dtype::CudaDType;
 use crate::kernel::{FlatLaunch, order_input, order_output};
+use crate::kernels::cublas_gemm::{self, CublasScalar};
 use crate::kernels::elementwise::planned_function;
 use crate::prelude_dev::*;
 
@@ -352,6 +368,15 @@ pub(crate) fn resolve_geom(
     })
 }
 
+/// `RSTSR_CUDA_MATMUL=tiled` forces the tiled kernel.
+///
+/// Two uses: comparing the two paths on one machine, and getting a hardware test of the fallback
+/// while cuBLAS is the default. Read once, so it cannot flip between launches.
+fn tiled_forced() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| matches!(std::env::var("RSTSR_CUDA_MATMUL").as_deref(), Ok("tiled")))
+}
+
 /// Launch `c = alpha * a @ b + beta * c` on the layout the tier already validated.
 ///
 /// `c` is taken by shared reference on purpose: its element type is either `T` (the `beta` path) or
@@ -370,7 +395,7 @@ pub(crate) fn gemm_launch<T, TBuf>(
     beta: T,
 ) -> Result<()>
 where
-    T: CudaDType,
+    T: CublasScalar,
 {
     let geom = resolve_geom(device.default_order(), lc, la, lb)?;
     let GemmGeom { m, n, k, n_batch, lane_a, lane_b, .. } = geom;
@@ -399,6 +424,30 @@ where
     let _ga = order_input(buf_a, exec)?;
     let _gb = order_input(buf_b, exec)?;
     let _gc = order_output(c, exec)?;
+
+    // cuBLAS first: it is the fast path for every layout it can express. A refusal or a non-success
+    // status falls through to the tiled kernel below, which handles the same shapes correctly and
+    // more slowly — so this branch can only change the speed, never the answer.
+    if !tiled_forced() {
+        if let (Some(args), Some(blas)) = (cublas_gemm::args(&geom), exec.cublas()) {
+            // SAFETY: the pointers are the buffers' bases folded with the layouts' own offsets, and
+            // `args` was derived from the same `geom` those offsets came from.
+            let status = unsafe {
+                cublas_gemm::launch(
+                    blas,
+                    &args,
+                    &alpha,
+                    &beta,
+                    offset_ptr(exec, buf_a, geom.a.0),
+                    offset_ptr(exec, buf_b, geom.b.0),
+                    offset_ptr(exec, c, geom.c.0),
+                )
+            };
+            if matches!(status, cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS) {
+                return Ok(());
+            }
+        }
+    }
 
     // The two fragments differ only in which axis the linear id follows; that is what makes each
     // variant coalesced on both operands' loads.

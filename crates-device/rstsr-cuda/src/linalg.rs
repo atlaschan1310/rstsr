@@ -13,8 +13,9 @@
 //!   [`gemm`], where the block owns a tile of the output and the contraction streams through shared
 //!   memory. It is also the only one that needs the batch axes, which ride in `grid.z`.
 
-use crate::dtype::{CudaArith, CudaDType, CudaReal};
+use crate::dtype::{CudaArith, CudaDType};
 use crate::kernels::elementwise;
+use crate::kernels::cublas_gemm::CublasScalar;
 use crate::kernels::gemm;
 use crate::prelude_dev::*;
 
@@ -87,16 +88,20 @@ where
     DC: DimAPI,
     Self: DeviceRawAPI<T, Raw = CudaBuffer<T>>
         + DeviceRawAPI<MaybeUninit<T>, Raw = CudaBuffer<MaybeUninit<T>>>,
-    // `num::Zero` is only used for the fresh-output path's `beta`, which the kernel then treats as
-    // "do not read c". It is not part of the arithmetic — that happens on the device.
+    // `num::Zero` is only used for the fresh-output path's `beta`, which both paths then treat as
+    // "do not read c" (cuBLAS has the same convention). It is not part of the arithmetic.
     //
-    // `CudaReal` keeps this impl off the complex dtypes, and that is deliberate, not an oversight:
-    // the kernel spells its zero as `(@T@)0`, which `rstsr_complex` has no single-argument
-    // constructor for, and `rstsr_complex.cuh` is spliced in only for the dtypes whose `INCLUDES`
-    // ask for it. A complex GEMM needs a zero that is a two-argument construction and a scalar
-    // multiply that the mixed-precision expression builders own — separate work, and better done
-    // with a measurement in hand than guessed at.
-    T: CudaDType + CudaReal + num::Zero,
+    // `CublasScalar` is the bound that matters: it names exactly the two dtypes cuBLAS's typed
+    // `gemm` covers, so it also excludes complex — and complex stays out on purpose. The tiled
+    // kernel spells its zero as `(@T@)0`, which `rstsr_complex` has no single-argument constructor
+    // for, so a complex instantiation would fail inside NVRTC (on a rented GPU) rather than here.
+    // A complex GEMM needs a zero spelled as a two-argument construction and the mixed-precision
+    // expression builders — separate work.
+    //
+    // Integers are excluded too. They *were* handled by the tiled kernel and are now not handled at
+    // all; that is a deliberate narrowing, because an integer GEMM path that has never run on
+    // hardware is worse than a compile error.
+    T: CublasScalar + num::Zero,
 {
     fn matmul(
         &self,

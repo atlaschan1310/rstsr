@@ -94,7 +94,7 @@ impl<T> CudaBuffer<T> {
     /// The stream this buffer was allocated on (owns free/reuse ordering).
     pub fn alloc_stream(&self) -> Arc<CudaStreamObj> {
         let stream = self.slice.stream();
-        Arc::new(CudaStreamObj { stream: stream.clone(), ordinal: stream.context().ordinal() })
+        Arc::new(CudaStreamObj::wrap(stream.context().ordinal(), stream.clone()))
     }
 
     /// Take ownership of the underlying allocation as a raw device pointer
