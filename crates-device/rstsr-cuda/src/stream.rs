@@ -13,20 +13,15 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 ///
 /// `cudarc` declares `unsafe impl Sync for CudaBlas`, so an `Arc<CudaBlas>` can be handed to any
 /// number of threads and the compiler will not object — but a `cublasHandle_t` is **not**
-/// thread-safe. Two host threads entering `cublas*gemm` on one handle at the same time interleave
-/// its internal launch state, and the failure is silent and bizarre rather than an error: with
-/// `cargo test`'s default parallelism this crate produced results containing values *larger than the
-/// operands can produce*, a batched call that wrote only the first slice, and columns of an output
-/// that were plainly not products of `a` and `b` at all. None of that is expressible as a wrong base
-/// pointer or a wrong leading dimension, which is what ruled the mapping out (see
-/// `tests::declared_lds_reproduce_the_product` and the audit in `geomprobe`).
+/// thread-safe: two host threads entering `cublas*gemm` on one handle at the same time is undefined
+/// behaviour, and it fails silently rather than with an error.
 ///
 /// The sharing itself is deliberate, not accidental: [`crate::registry`] caches one
-/// [`CudaStreamObj`] per ordinal, so every `DeviceCuda::new(0)` in a process runs on one stream.
-/// That is a good default — a stream is thread-safe at the CUDA API level, so kernel launches and
-/// copies from several threads order correctly — and it is exactly why the tiled kernel never showed
-/// this while the cuBLAS path did. The handle therefore needs its own serialization, and it is kept
-/// *inside* this type so a caller cannot forget it: the guard is taken by
+/// [`CudaStreamObj`] per ordinal, so every `DeviceCuda::new(0)` in a process runs on one stream. That
+/// is a good default — a stream *is* thread-safe at the CUDA API level, so kernel launches and copies
+/// from several threads order correctly — and it is why the tiled kernel never needed this while the
+/// cuBLAS path did. The handle therefore needs its own serialization, and it is kept *inside* this
+/// type so a caller cannot forget it: the guard is taken by
 /// [`cublas_gemm::launch`][crate::kernels::cublas_gemm::launch], the only place that talks to cuBLAS.
 ///
 /// Serializing the calls costs nothing measurable: `cublas*gemm` returns after enqueueing, and the

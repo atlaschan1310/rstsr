@@ -377,6 +377,17 @@ fn tiled_forced() -> bool {
     *FLAG.get_or_init(|| matches!(std::env::var("RSTSR_CUDA_MATMUL").as_deref(), Ok("tiled")))
 }
 
+/// `RSTSR_CUDA_DEBUG_GEMM=1` prints the resolved geometry and the exact cuBLAS arguments, once.
+///
+/// This exists because a wrong answer has two very different causes that look alike from the test
+/// side — the geometry we derived, or how the call was issued — and the only way to tell them apart
+/// on a machine we cannot attach a debugger to is to print what was actually decided. Cheap enough
+/// to leave in: one env lookup, and nothing at all when the variable is absent.
+fn debug_gemm() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("RSTSR_CUDA_DEBUG_GEMM").is_some())
+}
+
 /// Launch `c = alpha * a @ b + beta * c` on the layout the tier already validated.
 ///
 /// `c` is taken by shared reference on purpose: its element type is either `T` (the `beta` path) or
@@ -434,18 +445,33 @@ where
     // concern: it is what made four `matmul` tests fail with answers no wrong `lda` could produce.
     if !tiled_forced() {
         if let (Some(args), Some(blas)) = (cublas_gemm::args(&geom), exec.cublas()) {
+            let (pa, pb, pc) = (
+                offset_ptr(exec, buf_a, geom.a.0),
+                offset_ptr(exec, buf_b, geom.b.0),
+                offset_ptr(exec, c, geom.c.0),
+            );
+            if debug_gemm() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "[rstsr-cuda gemm] geom: m={m} n={n} k={k} batch={n_batch} \
+                         order={:?} swapped={} opts={:?} lanes={lane_a:?}/{lane_b:?}",
+                        device.default_order(),
+                        geom.swapped,
+                        T::CNAME
+                    );
+                    eprintln!("[rstsr-cuda gemm] geom.a={:?} geom.b={:?} geom.c={:?}", geom.a, geom.b, geom.c);
+                    eprintln!("[rstsr-cuda gemm] args={args:?}");
+                    eprintln!(
+                        "[rstsr-cuda gemm] ptr_a={pa:#x} ptr_b={pb:#x} ptr_c={pc:#x} esz={}",
+                        core::mem::size_of::<T>()
+                    );
+                });
+            }
             // SAFETY: the pointers are the buffers' bases folded with the layouts' own offsets, and
             // `args` was derived from the same `geom` those offsets came from.
             let status = unsafe {
-                cublas_gemm::launch(
-                    blas,
-                    &args,
-                    &alpha,
-                    &beta,
-                    offset_ptr(exec, buf_a, geom.a.0),
-                    offset_ptr(exec, buf_b, geom.b.0),
-                    offset_ptr(exec, c, geom.c.0),
-                )
+                cublas_gemm::launch(blas, &args, &alpha, &beta, pa, pb, pc)
             };
             if matches!(status, cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS) {
                 return Ok(());

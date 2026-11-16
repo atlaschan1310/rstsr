@@ -41,10 +41,8 @@
 //!
 //! A `cublasHandle_t` is not thread-safe, and this crate shares one per ordinal (see
 //! [`CudaStreamObj`][crate::stream::CudaStreamObj]). [`launch`] therefore takes the handle's lock
-//! itself. This is not defensive: without it, four of the seven `matmul` tests produced results that
-//! no base-pointer or leading-dimension error could explain — values larger than the operands can
-//! produce, a batched call that wrote only its first slice, and whole columns of an output that were
-//! not products of the operands at all.
+//! itself. That is a requirement of cuBLAS, not a precaution: two host threads entering a `gemm` on
+//! one handle at the same time is undefined.
 
 use cudarc::cublas::sys;
 
@@ -203,6 +201,10 @@ pub(crate) struct CublasArgs {
     pub ldc: i32,
     /// Batch element steps, named after the **geom** operands. `batch_b` belongs to `geom.b`, which
     /// [`launch`] places in cuBLAS's A slot — the naming follows the data, not the slot.
+    ///
+    /// **These are element counts, not bytes.** cuBLAS documents `strideA` as "the offset in number
+    /// of elements between `A[i]` and `A[i+1]`", which is the opposite of what `cublasSetVector`'s
+    /// `elemSize` does two sections earlier, and getting it wrong is invisible for `batchCount == 1`.
     pub batch_a: isize,
     pub batch_b: isize,
     pub batch_c: isize,
@@ -295,6 +297,21 @@ fn op(t: bool) -> sys::cublasOperation_t {
     }
 }
 
+/// The `strideA`, `strideB`, `strideC` triple cuBLAS receives, in **elements**, ordered by cuBLAS's
+/// slots rather than by our operand names: `geom.b` sits in slot A, `geom.a` in slot B.
+///
+/// This is a separate function for one reason. cuBLAS's typed strided-batched API takes element
+/// offsets — "the offset in number of elements between `A[i]` and `A[i+1]`" — while `cublasSetVector`
+/// two sections earlier in the same manual takes bytes. The conversion therefore must **not** happen
+/// anywhere, and a `* size_of::<T>()` inserted here is invisible to every `batchCount == 1` test: it
+/// leaves the first slice exact, loses the rest, and writes the surplus into whatever the allocator
+/// placed next, which is how it presented on hardware (a batched matmul with correct first `m*n`
+/// outputs and zeroed later slices, plus unrelated tests failing at random). Naming the triple keeps
+/// the unit in one place, where [`tests::batch_strides_are_element_counts`] can assert it.
+fn batch_strides(a: &CublasArgs) -> (i64, i64, i64) {
+    (a.batch_b as i64, a.batch_a as i64, a.batch_c as i64)
+}
+
 /// Issue the `gemm`. Returns the cuBLAS status; the caller falls back to the tiled kernel on any
 /// non-success, because a returned status is a launch-time validation failure and nothing has been
 /// enqueued.
@@ -302,13 +319,26 @@ fn op(t: bool) -> sys::cublasOperation_t {
 /// The pointers are named after the **geom** operands; the slot swap happens here, once, and is the
 /// same swap [`args`] assumes.
 ///
+/// # The strides are element counts
+///
+/// `strideA/B/C` are passed straight through from [`CublasArgs`], which holds them in elements
+/// because that is what cuBLAS's strided-batched API takes — "the offset in number of elements
+/// between `A[i]` and `A[i+1]`". Multiplying by `size_of::<T>()` here is the obvious-looking mistake
+/// and it does not fail loudly: `batchCount == 1` ignores the strides entirely, and for a batch the
+/// first slice is still correct while every later slice is read and written eight times too far
+/// along for `f64`. On hardware that showed up as a batched matmul whose first `m*n` outputs were
+/// exact and whose remaining slices were untouched, plus *other* tests failing at random with values
+/// larger than the operands could produce — the stray writes landing in whatever the caching
+/// allocator had placed next.
+///
 /// The handle's lock is taken **here** rather than by the caller: a `cublasHandle_t` is not
 /// thread-safe, and this stream's handle is shared by every thread that uses the ordinal, so this is
 /// the one call that has to be serialized and the one place a guard cannot be forgotten. See
-/// [`crate::stream::CublasHandle`] for what happens without it.
+/// [`CublasHandle`].
 ///
 /// # Safety
-/// The three pointers must be valid for `geom`'s extents on the handle's stream.
+/// The three pointers must be valid for `geom`'s extents on the handle's stream, including the batch
+/// range `batchCount * stride` reaches.
 pub(crate) unsafe fn launch<T: CublasScalar>(
     blas: &CublasHandle,
     a: &CublasArgs,
@@ -320,7 +350,7 @@ pub(crate) unsafe fn launch<T: CublasScalar>(
 ) -> sys::cublasStatus_t {
     let _api = blas.lock();
     let handle = *blas.blas().handle();
-    let esz = core::mem::size_of::<T>() as i64;
+    let (stride_a, stride_b, stride_c) = batch_strides(a);
     unsafe {
         if a.batch > 1 {
             T::gemm_strided_batched(
@@ -331,16 +361,17 @@ pub(crate) unsafe fn launch<T: CublasScalar>(
                 a.no,
                 a.ko,
                 alpha,
+                // slot A holds `geom.b`, slot B holds `geom.a`; the strides follow the buffer.
                 ptr_b,
                 a.lda,
-                a.batch_b as i64 * esz,
+                stride_a,
                 ptr_a,
                 a.ldb,
-                a.batch_a as i64 * esz,
+                stride_b,
                 beta,
                 ptr_c,
                 a.ldc,
-                a.batch_c as i64 * esz,
+                stride_c,
                 a.batch,
             )
         } else {
@@ -481,6 +512,42 @@ mod tests {
         // `args` is defence in depth rather than a live branch, so only the Ok arm asserts.
         if let Ok(g) = resolve_geom(RowMajor, &lc3, &la3, &lb3) {
             assert!(args(&g).is_none(), "a reversed operand has no cuBLAS expression");
+        }
+    }
+
+    /// The batch strides are **element** counts and exactly one matrix apart.
+    ///
+    /// The convention is cuBLAS's, not ours: the typed strided-batched API documents `strideA` as
+    /// "the offset in number of elements between `A[i]` and `A[i+1]`", while `cublasSetVector` takes
+    /// bytes. A `* size_of::<T>()` in [`batch_strides`] — the one place that produces these values —
+    /// is invisible to every `batchCount == 1` fixture: it leaves the first slice exact, drops the
+    /// rest, and writes the surplus into whatever the allocator placed next. That is not a
+    /// hypothetical: it is what the first hardware run of this path did.
+    #[test]
+    fn batch_strides_are_element_counts() {
+        let (p, m, k, n) = (5usize, 12usize, 16usize, 8usize);
+        let la = layout(&[p, m, k], &[(m * k) as isize, k as isize, 1], 0);
+        let lb = layout(&[p, k, n], &[(k * n) as isize, n as isize, 1], 0);
+        let lc = layout(&[p, m, n], &[(m * n) as isize, n as isize, 1], 0);
+        let g = resolve_geom(RowMajor, &lc, &la, &lb).unwrap();
+        let a = args(&g).unwrap();
+        assert_eq!(a.batch, p as i32);
+
+        let (stride_a, stride_b, stride_c) = batch_strides(&a);
+        // slot A holds `geom.b` (k x n), slot B holds `geom.a` (m x k)
+        assert_eq!(stride_a, (k * n) as i64, "slot A steps by one k x n matrix, in elements");
+        assert_eq!(stride_b, (m * k) as i64, "slot B steps by one m x k matrix, in elements");
+        assert_eq!(stride_c, (m * n) as i64, "the output steps by one m x n matrix, in elements");
+
+        // The last slice's last element must still be inside each buffer. This is the assertion an
+        // element-size scaling breaks, and only a batched fixture can fail it.
+        let last = a.batch as i64 - 1;
+        for (step, per_slice, whole, what) in [
+            (stride_a, (k * n) as i64, (p * k * n) as i64, "slot A (geom.b)"),
+            (stride_b, (m * k) as i64, (p * m * k) as i64, "slot B (geom.a)"),
+            (stride_c, (m * n) as i64, (p * m * n) as i64, "output"),
+        ] {
+            assert!(last * step + per_slice <= whole, "{what}: the batch walk leaves its buffer");
         }
     }
 
