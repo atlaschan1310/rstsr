@@ -36,13 +36,22 @@
 //! - a non-float dtype, a dimension over `i32`, or a failed `cublasCreate`/`cublasDgemm`.
 //!
 //! Every refusal is silent: the caller runs the tiled kernel and gets the right answer, slower.
+//!
+//! # Thread safety
+//!
+//! A `cublasHandle_t` is not thread-safe, and this crate shares one per ordinal (see
+//! [`CudaStreamObj`][crate::stream::CudaStreamObj]). [`launch`] therefore takes the handle's lock
+//! itself. This is not defensive: without it, four of the seven `matmul` tests produced results that
+//! no base-pointer or leading-dimension error could explain — values larger than the operands can
+//! produce, a batched call that wrote only its first slice, and whole columns of an output that were
+//! not products of the operands at all.
 
 use cudarc::cublas::sys;
-use cudarc::cublas::CudaBlas;
 
 use crate::dtype::CudaDType;
 use crate::kernels::gemm::GemmGeom;
 use crate::prelude_dev::*;
+use crate::stream::CublasHandle;
 
 /// The float widths cuBLAS's typed `gemm` covers, which is exactly what `DeviceMatMulAPI` is
 /// instantiated for on this device.
@@ -293,10 +302,15 @@ fn op(t: bool) -> sys::cublasOperation_t {
 /// The pointers are named after the **geom** operands; the slot swap happens here, once, and is the
 /// same swap [`args`] assumes.
 ///
+/// The handle's lock is taken **here** rather than by the caller: a `cublasHandle_t` is not
+/// thread-safe, and this stream's handle is shared by every thread that uses the ordinal, so this is
+/// the one call that has to be serialized and the one place a guard cannot be forgotten. See
+/// [`crate::stream::CublasHandle`] for what happens without it.
+///
 /// # Safety
 /// The three pointers must be valid for `geom`'s extents on the handle's stream.
 pub(crate) unsafe fn launch<T: CublasScalar>(
-    blas: &CudaBlas,
+    blas: &CublasHandle,
     a: &CublasArgs,
     alpha: &T,
     beta: &T,
@@ -304,7 +318,8 @@ pub(crate) unsafe fn launch<T: CublasScalar>(
     ptr_b: u64,
     ptr_c: u64,
 ) -> sys::cublasStatus_t {
-    let handle = *blas.handle();
+    let _api = blas.lock();
+    let handle = *blas.blas().handle();
     let esz = core::mem::size_of::<T>() as i64;
     unsafe {
         if a.batch > 1 {

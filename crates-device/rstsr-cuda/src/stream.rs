@@ -5,7 +5,61 @@ use crate::prelude_dev::*;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::CudaContext;
 use cudarc::driver::CudaStream;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+/// A cuBLAS handle plus the lock that makes sharing it between threads legal.
+///
+/// # Why the lock is not optional
+///
+/// `cudarc` declares `unsafe impl Sync for CudaBlas`, so an `Arc<CudaBlas>` can be handed to any
+/// number of threads and the compiler will not object — but a `cublasHandle_t` is **not**
+/// thread-safe. Two host threads entering `cublas*gemm` on one handle at the same time interleave
+/// its internal launch state, and the failure is silent and bizarre rather than an error: with
+/// `cargo test`'s default parallelism this crate produced results containing values *larger than the
+/// operands can produce*, a batched call that wrote only the first slice, and columns of an output
+/// that were plainly not products of `a` and `b` at all. None of that is expressible as a wrong base
+/// pointer or a wrong leading dimension, which is what ruled the mapping out (see
+/// `tests::declared_lds_reproduce_the_product` and the audit in `geomprobe`).
+///
+/// The sharing itself is deliberate, not accidental: [`crate::registry`] caches one
+/// [`CudaStreamObj`] per ordinal, so every `DeviceCuda::new(0)` in a process runs on one stream.
+/// That is a good default — a stream is thread-safe at the CUDA API level, so kernel launches and
+/// copies from several threads order correctly — and it is exactly why the tiled kernel never showed
+/// this while the cuBLAS path did. The handle therefore needs its own serialization, and it is kept
+/// *inside* this type so a caller cannot forget it: the guard is taken by
+/// [`cublas_gemm::launch`][crate::kernels::cublas_gemm::launch], the only place that talks to cuBLAS.
+///
+/// Serializing the calls costs nothing measurable: `cublas*gemm` returns after enqueueing, and the
+/// work it enqueued is on one stream, so it was going to be ordered anyway.
+pub struct CublasHandle {
+    blas: CudaBlas,
+    /// Held for the duration of one cuBLAS API call. Not a device-side lock: it orders *host*
+    /// entries into the handle, which is the only thing cuBLAS requires and the only thing it fails
+    /// to provide itself.
+    api: Mutex<()>,
+}
+
+impl CublasHandle {
+    fn new(blas: CudaBlas) -> Self {
+        Self { blas, api: Mutex::new(()) }
+    }
+
+    /// The raw handle. Callers must hold the guard from [`Self::lock`] around every use.
+    pub(crate) fn blas(&self) -> &CudaBlas {
+        &self.blas
+    }
+
+    /// Serialize one cuBLAS API call.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.api.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl std::fmt::Debug for CublasHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CublasHandle").finish_non_exhaustive()
+    }
+}
 
 /// A CUDA stream of one ordinal. Identity is (handle, context); the device
 /// value's stream participates in `same_device` strictly.
@@ -20,7 +74,7 @@ pub struct CudaStreamObj {
     /// across streams would enqueue work on the wrong one. `None` is cached because probing means
     /// dlopening `libcublas`, which either works once or never — retrying per launch would turn a
     /// missing library into a per-call panic.
-    cublas_slot: OnceLock<Option<Arc<CudaBlas>>>,
+    cublas_slot: OnceLock<Option<Arc<CublasHandle>>>,
 }
 
 impl CudaStreamObj {
@@ -47,13 +101,17 @@ impl CudaStreamObj {
     /// missing rather than returning an error, so a machine without `libcublas` would abort here.
     /// The probe is therefore wrapped in `catch_unwind`; the panic message still reaches stderr once
     /// per stream, which is the only signal the user gets that they are on the slow path.
-    pub(crate) fn cublas(&self) -> Option<&Arc<CudaBlas>> {
+    ///
+    /// The returned handle is shared by every thread that uses this stream, and a `cublasHandle_t`
+    /// is not thread-safe — take [`CublasHandle::lock`] before every call, or better, call
+    /// [`cublas_gemm::launch`][crate::kernels::cublas_gemm::launch], which does it for you.
+    pub(crate) fn cublas(&self) -> Option<&Arc<CublasHandle>> {
         self.cublas_slot
             .get_or_init(|| {
                 let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     CudaBlas::new(self.stream.clone())
                 }));
-                made.ok().and_then(|r| r.ok()).map(Arc::new)
+                made.ok().and_then(|r| r.ok()).map(|blas| Arc::new(CublasHandle::new(blas)))
             })
             .as_ref()
     }

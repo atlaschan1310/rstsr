@@ -143,3 +143,60 @@ fn tiled_matmul_from_vs_cpu() {
     rt::matmul_from(&mut c_cpu, &a_cpu, &b_cpu, 2.0f64, 3.0f64);
     assert_eq!(host_nd(&c), host_nd(&c_cpu), "c = 2*(a@b) + 3*c");
 }
+
+/// The two fixtures that used to be cuBLAS-only: `ColMajor`, and the length-1 axis of GEMV/GEVM.
+///
+/// This exists to make one comparison possible. Both paths share `resolve_geom` — the col-major
+/// reversal, the operand swap, the batch steps, the degenerate-axis strides — and differ only in how
+/// the geometry is consumed. So if these shapes pass here and fail through cuBLAS, the geometry is
+/// not the difference. That is exactly what happened: `cuda matmul` failed on col-major, batched,
+/// transposed and gevm while this file was green for the latter two, and a parallel-run corruption of
+/// the shared cuBLAS handle was the only explanation left standing.
+#[test]
+fn tiled_col_major_and_gemv_gevm() {
+    tiled_and_cuda!();
+
+    // ColMajor: reverse every layout, swap the operands.
+    let mut d = DeviceCuda::new(0);
+    d.set_default_order(ColMajor);
+    let mut dcpu = DeviceCpuSerial::default();
+    dcpu.set_default_order(ColMajor);
+    let (m, k, n) = (20usize, 12usize, 32usize);
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(m * k, 41), &dcpu)).into_shape([m, k]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(k * n, 42), &dcpu)).into_shape([k, n]);
+    let a = a_cpu.to_device(&d);
+    let b = b_cpu.to_device(&d);
+    assert_eq!(
+        host_nd(&rt::matmul(&a, &b)),
+        host_nd(&rt::matmul(&a_cpu, &b_cpu)),
+        "col-major ({m} x {k}) @ ({k} x {n})"
+    );
+
+    // Rules 3 and 4: a length-1 tile axis, which is where the vector's own rank has to be folded
+    // into a 2-D matmul part (`dim_insert`, i.e. a stride-1 axis of extent 1).
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+    let (m, k, n) = (24usize, 16usize, 18usize);
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(m * k, 31), &dcpu)).into_shape([m, k]);
+    let v_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::asarray((exact_data(k, 32), &dcpu));
+    let w_cpu: Tensor<f64, DeviceCpuSerial, _> = rt::asarray((exact_data(k, 33), &dcpu));
+    let c_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(k * n, 34), &dcpu)).into_shape([k, n]);
+    let a = a_cpu.to_device(&d);
+    let v = v_cpu.to_device(&d);
+    let w = w_cpu.to_device(&d);
+    let c = c_cpu.to_device(&d);
+    assert_eq!(
+        host_nd(&rt::matmul(&a, &v).to_contig(RowMajor)),
+        host_nd(&rt::matmul(&a_cpu, &v_cpu).to_contig(RowMajor)),
+        "gemv: [m,k] @ [k]"
+    );
+    assert_eq!(
+        host_nd(&rt::matmul(&w, &c).to_contig(RowMajor)),
+        host_nd(&rt::matmul(&w_cpu, &c_cpu).to_contig(RowMajor)),
+        "gevm: [k] @ [k,n]"
+    );
+}

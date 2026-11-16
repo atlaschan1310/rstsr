@@ -428,6 +428,10 @@ where
     // cuBLAS first: it is the fast path for every layout it can express. A refusal or a non-success
     // status falls through to the tiled kernel below, which handles the same shapes correctly and
     // more slowly — so this branch can only change the speed, never the answer.
+    //
+    // `launch` takes the handle's lock itself, because that handle is shared by every thread using
+    // this ordinal and `cublasHandle_t` is not thread-safe. That omission is not a theoretical
+    // concern: it is what made four `matmul` tests fail with answers no wrong `lda` could produce.
     if !tiled_forced() {
         if let (Some(args), Some(blas)) = (cublas_gemm::args(&geom), exec.cublas()) {
             // SAFETY: the pointers are the buffers' bases folded with the layouts' own offsets, and

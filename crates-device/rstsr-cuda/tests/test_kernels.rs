@@ -1292,4 +1292,48 @@ fn matmul_col_major_vs_cpu() {
     assert_eq!(got, want, "col-major ({m} x {k}) @ ({k} x {n})");
 }
 
+/// Several threads using one device at once, which is one stream and therefore one cuBLAS handle.
+///
+/// This is a regression test with a specific history: `cublasHandle_t` is not thread-safe, but
+/// `cudarc` declares `unsafe impl Sync for CudaBlas`, and the registry's one-stream-per-ordinal cache
+/// hands every `DeviceCuda::new(0)` the same handle. Before `CudaStreamObj::cublas` returned a
+/// handle that serializes each call, `cargo test`'s default parallelism — this file's seven `matmul`
+/// tests running at once — produced values **larger than the operands can produce**, a batched call
+/// that wrote only its first slice, and columns of an output that were not products of `a` and `b`.
+/// No error in the mapping can do that; a shared handle under concurrent entry can.
+///
+/// The failure mode is a race, so a single-threaded run proves nothing either way — the point of
+/// hammering one handle from four threads is to make the window wide enough to be reliable.
+#[test]
+fn matmul_from_several_threads_on_one_device() {
+    require_cuda!();
+    let (m, k, n) = (24usize, 16usize, 20usize);
+    let dcpu = DeviceCpuSerial::default();
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(m * k, 61), &dcpu)).into_shape([m, k]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(k * n, 62), &dcpu)).into_shape([k, n]);
+    let want = host_nd(&rt::matmul(&a_cpu, &b_cpu));
+
+    let (a_data, b_data) = (exact_data(m * k, 61), exact_data(k * n, 62));
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let (a_data, b_data, want) = (&a_data, &b_data, &want);
+            scope.spawn(move || {
+                let d = DeviceCuda::new(0);
+                let a = rt::asarray((a_data.clone(), &d)).into_shape([m, k]);
+                let b = rt::asarray((b_data.clone(), &d)).into_shape([k, n]);
+                for round in 0..8 {
+                    assert_eq!(
+                        host_nd(&rt::matmul(&a, &b)),
+                        *want,
+                        "thread-local round {round}: a concurrent call on the shared stream returned \
+                         a different product"
+                    );
+                }
+            });
+        }
+    });
+}
+
 /* #endregion */
