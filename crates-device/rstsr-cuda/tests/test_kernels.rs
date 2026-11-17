@@ -1345,3 +1345,135 @@ fn matmul_from_several_threads_on_one_device() {
 }
 
 /* #endregion */
+
+/* #region tensordot */
+
+/// The tier-0 promise: a contraction that is a GEMM over **views**, so no copy is made.
+///
+/// Every case here is one the planner accepts; the refusals are pinned by
+/// [`tensordot_refuses_a_contraction_that_needs_a_pack`]. What is being tested is not the arithmetic
+/// (cuBLAS owns that) but the *scheduling*: the axis reorder to `[free…, ctr…]` / `[ctr…, free…]`,
+/// the merge of each block into one `M`/`K`/`N` factor, and the handover to `matmul`.
+#[test]
+fn tensordot_views_only_vs_cpu() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let dcpu = DeviceCpuSerial::default();
+
+    // (5,4) @ (4,6), contracting a's trailing with b's leading axis.
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(5 * 4, 71), &dcpu)).into_shape([5, 4]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(4 * 6, 72), &dcpu)).into_shape([4, 6]);
+    let (a, b) = (a_cpu.to_device(&d), b_cpu.to_device(&d));
+    assert_eq!(
+        host_nd(&rt::tensordot(&a, &b, 1)),
+        host_nd(&rt::tensordot(&a_cpu, &b_cpu, 1)),
+        "2-D: contract a[i, k] with b[k, j]"
+    );
+
+    // A left operand whose `m` axis is contiguous. The canonical block is already `[m, k]` with
+    // strides `[1, m]`, i.e. a 2-D layout cuBLAS takes as `OP_T` with `lda = m` — the case that
+    // would silently transpose if the planner or the geometry got the roles wrong.
+    let base_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(4 * 5, 73), &dcpu)).into_shape([4, 5]);
+    let at_cpu = base_cpu.swapaxes(0, 1);
+    let at = at_cpu.to_device(&d);
+    assert_eq!(at.layout().stride()[0], 1, "fixture: the m axis must be the contiguous one");
+    assert_eq!(
+        host_nd(&rt::tensordot(&at, &b, 1)),
+        host_nd(&rt::tensordot(&at_cpu, &b_cpu, 1)),
+        "2-D with an m-contiguous left operand (OP_T)"
+    );
+
+    // (2,3,4) @ (3,4,5) contracting a's trailing *block* with b's leading block: the K factor is a
+    // merge of two axes on each side, still a view.
+    let a3_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(2 * 3 * 4, 74), &dcpu)).into_shape([2, 3, 4]);
+    let b3_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(3 * 4 * 5, 75), &dcpu)).into_shape([3, 4, 5]);
+    let (a3, b3) = (a3_cpu.to_device(&d), b3_cpu.to_device(&d));
+    assert_eq!(
+        host_nd(&rt::tensordot(&a3, &b3, ([1, 2], [0, 1]))),
+        host_nd(&rt::tensordot(&a3_cpu, &b3_cpu, ([1, 2], [0, 1]))),
+        "3-D: contract a's trailing block"
+    );
+
+    // The *leading*-axis orientation: contract a's axis 0 of (3,4,5) with (3,2). The free block of
+    // `a` is (4,5) with the contracted axis trailing in memory, so the 2-D block comes back as
+    // [20, 3] with strides [1, 20] — unit stride on `M`, i.e. an `OP_T` handover. This was the case
+    // I expected tier 0 to refuse; the audit in `probe/geomprobe` showed it does not, so it is pinned
+    // here rather than left to the doc comment.
+    let l_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(3 * 4 * 5, 82), &dcpu)).into_shape([3, 4, 5]);
+    let m_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(3 * 2, 83), &dcpu)).into_shape([3, 2]);
+    let (l, m) = (l_cpu.to_device(&d), m_cpu.to_device(&d));
+    assert_eq!(
+        host_nd(&rt::tensordot(&l, &m, ([0], [0]))),
+        host_nd(&rt::tensordot(&l_cpu, &m_cpu, ([0], [0]))),
+        "3-D: contract a's leading axis (the OP_T handover)"
+    );
+
+    // The DF-MP2 shape: one contracted axis, two free axes on the left, one on the right. This is
+    // `(i, a, P) x (P, b) -> (i, a, b)`, the pair-energy tile, and it must not need a pack.
+    let c_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(3 * 4 * 5, 76), &dcpu)).into_shape([3, 4, 5]);
+    let v_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(5 * 2, 77), &dcpu)).into_shape([5, 2]);
+    let (c, v) = (c_cpu.to_device(&d), v_cpu.to_device(&d));
+    assert_eq!(
+        host_nd(&rt::tensordot(&c, &v, ([2], [0]))),
+        host_nd(&rt::tensordot(&c_cpu, &v_cpu, ([2], [0]))),
+        "DF-MP2 tile: (i, a, P) x (P, b)"
+    );
+}
+
+/// `ColMajor`: the planner is given col-major canonical blocks, and the geometry reverses and swaps
+/// them. A transposed answer is the failure mode, so the fixture is rectangular in every axis.
+#[test]
+fn tensordot_col_major_vs_cpu() {
+    require_cuda!();
+    let mut d = DeviceCuda::new(0);
+    d.set_default_order(ColMajor);
+    let mut dcpu = DeviceCpuSerial::default();
+    dcpu.set_default_order(ColMajor);
+
+    let a_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(4 * 5 * 3, 78), &dcpu)).into_shape([4, 5, 3]);
+    let b_cpu: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((exact_data(3 * 6, 79), &dcpu)).into_shape([3, 6]);
+    let (a, b) = (a_cpu.to_device(&d), b_cpu.to_device(&d));
+
+    let got = host_nd(&rt::tensordot(&a, &b, ([2], [0])));
+    assert_eq!(got.len(), 4 * 5 * 6, "a transposed answer would have the wrong extent");
+    assert_eq!(got, host_nd(&rt::tensordot(&a_cpu, &b_cpu, ([2], [0]))), "col-major tensordot");
+}
+
+/// The boundary, pinned rather than discovered later: a `K` that is not one stride declines.
+///
+/// Contracting `a`'s axes `[0, 2]` of `(2, 3, 4)` leaves the two contracted axes with a hole between
+/// them in memory (strides `24` and `1`), so no single leading dimension spans `K`. That is the only
+/// kind of case tier 0 refuses: an *orientation* is not a problem — a block with unit stride on `M`
+/// instead of `N` is handed to cuBLAS as `OP_T`, which is why the leading-axis form in
+/// [`tensordot_views_only_vs_cpu`] works.
+///
+/// The verdict is a property of shape and strides alone, so it reproduces without a GPU; the
+/// companion audit in `probe/geomprobe` (bin `tensordot`) walks both sides of it.
+#[test]
+fn tensordot_refuses_a_contraction_that_needs_a_pack() {
+    require_cuda!();
+    let d = DeviceCuda::new(0);
+    let a: Tensor<f64, _, _> = rt::asarray((exact_data(2 * 3 * 4, 80), &d)).into_shape([2, 3, 4]);
+    let b: Tensor<f64, _, _> = rt::asarray((exact_data(2 * 4 * 5, 81), &d)).into_shape([2, 4, 5]);
+
+    match rt::tensordot_f(&a, &b, ([0, 2], [0, 1])) {
+        Ok(_) => panic!("a K with a hole should be refused, but it computed a result"),
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(msg.contains("packing pass"), "expected the pack reason, got: {msg}");
+        },
+    }
+}
+
+/* #endregion */

@@ -1,6 +1,6 @@
-//! `DeviceOuterAPI`, `DeviceCrossAPI` and `DeviceMatMulAPI` for `DeviceCuda`.
+//! `DeviceOuterAPI`, `DeviceCrossAPI`, `DeviceMatMulAPI` and `DeviceTensordotAPI` for `DeviceCuda`.
 //!
-//! Three very different amounts of work, and they sit in one file because the split is about *who
+//! Four very different amounts of work, and they sit in one file because the split is about *who
 //! owns the geometry*, not about the operator:
 //!
 //! - `outer` is a planned **binary** launch. The two 1-D operands are widened onto the `(n, m)`
@@ -12,6 +12,9 @@
 //! - `matmul` is the only operation here whose *thread geometry* is the point: a tiled GEMM in
 //!   [`gemm`], where the block owns a tile of the output and the contraction streams through shared
 //!   memory. It is also the only one that needs the batch axes, which ride in `grid.z`.
+//! - `tensordot` owns no geometry at all: it is a *scheduler* over `matmul`. The axis reorder and the
+//!   block merges are a pure function of layouts shared with every other backend, so the impl is the
+//!   planner plus one call — and the interesting part is what it does when the planner declines.
 
 use crate::dtype::{CudaArith, CudaDType};
 use crate::kernels::elementwise;
@@ -150,5 +153,107 @@ where
             alpha,
             <T as num::Zero>::zero(),
         )
+    }
+}
+
+/// `tensordot` as a single GEMM — tier 0 only: **views, never a copy.**
+///
+/// # Why this is only a few lines
+///
+/// A contraction is not a BLAS operation. cuBLAS's contract is exactly "one 2-D product, each
+/// operand addressed by a leading dimension on one axis" (see `kernels::cublas_gemm`), so
+/// the whole of `tensordot` above that call is *scheduling*: reorder each operand to
+/// `[free…, ctr…]` / `[ctr…, free…]`, and ask whether each of the three blocks collapses to 2-D
+/// without materializing data. That decision already exists as
+/// [`tensordot_gemm_layouts`] — a pure function of layouts, shared by every backend in the
+/// workspace — so this impl is the planner
+/// plus [`Self::matmul_uninit`], which lands in cuBLAS.
+///
+/// # Where tier 0 actually stops
+///
+/// Verified host-side before the GPU ever sees it (`probe/geomprobe`, bin `tensordot`, which walks
+/// every `(m, k)` of the returned blocks and checks that their offsets are the elements the
+/// contraction names):
+///
+/// - **Both orientations are covered.** A block that is contiguous on its `M` axis instead of `N`
+///   comes back as a 2-D layout with unit stride on `M`, which the cuBLAS argument derivation
+///   turns into `OP_T`. So contracting a *leading* axis of `a` — `(3,4,5) over [0]` — is a GEMM, not
+///   a pack: `a` arrives as `[20, 3]` with strides `[1, 20]`. This is better than expected and worth
+///   stating, because the opposite was the natural assumption.
+/// - **What declines is a `K` that is not one stride.** Contracting `a`'s axes `[0, 2]` leaves the
+///   axes with a hole between them (`24` and `1`), so no single leading dimension spans `K`. Same for
+///   any free/contracted interleave that no one-stride pair covers.
+///
+/// The planner also only ever inspects layouts, so its verdict is a property of the *shape and
+/// strides*, never of the data: a refusal is reproducible without a GPU.
+///
+/// # What is deliberately absent: the pack
+///
+/// When the planner declines, the CPU implementations fall back to a naive scalar kernel, which is
+/// within a few times of BLAS there. On a GPU that fallback is not a fallback: a naive contraction is
+/// DRAM-bound at `2k/(8(k+1)) ≈ 0.25` flop/byte, about 0.4 TFLOP/s on an A100, against `dgemm`'s
+/// 19.5 — a factor of ~50. So the honest GPU answer is a *third* tier, "pack the operand that does
+/// not collapse, then the same GEMM", not the scalar loop.
+///
+/// That tier is not implemented, and until it is this function **refuses by name** rather than
+/// silently unpacking into something slow: a pack costs one extra pass over `m*k` elements and buys
+/// `2*m*k*n` flops, so it is nearly always the right trade — it just needs its own measurement
+/// before it becomes the default. The refusal prints the three layouts, because "which block failed
+/// to merge" is otherwise invisible.
+///
+/// # One asymmetry with `matmul`, on purpose
+///
+/// `matmul` refuses an inner dot ("single-axis contraction") and points at the reduce kernel,
+/// because the tiled fallback would put 256 threads on a `1 x 1` output. `tensordot` accepts it: the
+/// planner yields `m = n = 1`, and cuBLAS runs a `1 x 1 x k` product without wasting anything. Same
+/// arithmetic, and here the fast path is the one that is already correct.
+///
+/// # What is refused for a different reason
+///
+/// `DeviceExtTensordotAPI` (mixed input dtypes) is not implemented at all: cuBLAS's typed `gemm`
+/// takes one dtype, and a mixed product needs `cublasGemmEx` with per-operand types. The tiled
+/// fallback is single-`@T@` too, so there is nothing here to fall back to.
+impl<T, DA, DB, DC> DeviceTensordotAPI<T, T, T, DA, DB, DC> for DeviceCuda
+where
+    DA: DimAPI,
+    DB: DimAPI,
+    DC: DimAPI,
+    Self: DeviceRawAPI<T, Raw = CudaBuffer<T>>
+        + DeviceRawAPI<MaybeUninit<T>, Raw = CudaBuffer<MaybeUninit<T>>>
+        + DeviceMatMulAPI<T, T, T, Ix2, Ix2, Ix2>,
+    T: CublasScalar + num::Zero + num::One,
+{
+    fn tensordot(
+        &self,
+        c: &mut CudaBuffer<MaybeUninit<T>>,
+        lc: &Layout<DC>,
+        a: &CudaBuffer<T>,
+        la: &Layout<DA>,
+        b: &CudaBuffer<T>,
+        lb: &Layout<DB>,
+        axes_a: &[isize],
+        axes_b: &[isize],
+    ) -> Result<()> {
+        let order = self.default_order();
+        let Some((la2, lb2, lc2)) = tensordot_gemm_layouts(la, axes_a, lb, axes_b, lc, order)? else {
+            rstsr_raise!(
+                UnImplemented,
+                "cuda tensordot: this contraction is not a GEMM over views, so it would need a \
+                 packing pass first (implemented on CPU as a naive kernel, deliberately not here: a \
+                 scalar contraction on a GPU is ~50x off cuBLAS). axes_a {axes_a:?}, axes_b \
+                 {axes_b:?}; a shape {:?} stride {:?}; b shape {:?} stride {:?}; c shape {:?} \
+                 stride {:?}",
+                la.shape(),
+                la.stride(),
+                lb.shape(),
+                lb.stride(),
+                lc.shape(),
+                lc.stride()
+            )?
+        };
+        // The three returned layouts address the same buffers `c`, `a`, `b` already are: the planner
+        // only reordered axes and merged blocks, so every element the GEMM reads or writes is one the
+        // caller handed us. `probe/geomprobe` walks those offsets element by element.
+        self.matmul_uninit(c, &lc2, a, &la2, b, &lb2, <T as num::One>::one())
     }
 }
