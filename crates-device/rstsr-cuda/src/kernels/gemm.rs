@@ -463,6 +463,10 @@ where
                     eprintln!("[rstsr-cuda gemm] geom.a={:?} geom.b={:?} geom.c={:?}", geom.a, geom.b, geom.c);
                     eprintln!("[rstsr-cuda gemm] args={args:?}");
                     eprintln!(
+                        "[rstsr-cuda gemm] compute_type_32f={:?}",
+                        device.compute_type_32f()
+                    );
+                    eprintln!(
                         "[rstsr-cuda gemm] ptr_a={pa:#x} ptr_b={pb:#x} ptr_c={pc:#x} esz={}",
                         core::mem::size_of::<T>()
                     );
@@ -470,11 +474,26 @@ where
             }
             // SAFETY: the pointers are the buffers' bases folded with the layouts' own offsets, and
             // `args` was derived from the same `geom` those offsets came from.
+            let entry = cublas_gemm::entry_for::<T>(device.compute_type_32f());
             let status = unsafe {
-                cublas_gemm::launch(blas, &args, &alpha, &beta, pa, pb, pc)
+                cublas_gemm::launch(blas, &args, &alpha, &beta, pa, pb, pc, entry)
             };
             if matches!(status, cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS) {
                 return Ok(());
+            }
+            // A refused compute type is otherwise indistinguishable from "the flag did nothing":
+            // the fallback below is exact, so the only symptom is the *absence* of a speedup. Say
+            // it once — `fasttf32` on a pre-Ampere device, or a shape cuBLAS declines to run in
+            // that mode, both land here.
+            if matches!(entry, cublas_gemm::GemmEntry::Ex(_)) {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "[rstsr-cuda gemm] cuBLAS refused compute type {:?} ({status:?}); falling back to \
+                         full-precision arithmetic. The result is exact, the speedup is not there.",
+                        device.compute_type_32f()
+                    );
+                });
             }
         }
     }

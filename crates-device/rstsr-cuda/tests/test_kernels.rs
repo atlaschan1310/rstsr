@@ -2034,3 +2034,91 @@ fn index_select_and_put_vs_cpu() {
 }
 
 /* #endregion */
+
+/* #region compute type (TF32 / 16F / 16BF) */
+
+/// The `RSTSR_CUDA_COMPUTE_TYPE_32F` flag must actually reach cuBLAS, and `Default` must stay exact.
+///
+/// The decisive assertion is **not** "TF32 is accurate enough" — that is a chemistry question for a
+/// real system — but "TF32 is not silently ignored". If the flag never reached `cublasGemmEx`, both
+/// runs would be bit-identical, and the experiment would read as *no speedup for no reason*, which
+/// is the one failure mode that cannot be distinguished from "the hardware has no TF32".
+///
+/// The reference is f64 computed from the **same f32 operands**, so the difference measured is the
+/// GEMM's arithmetic alone, not the rounding of the inputs. The values are `k/7`, which needs the
+/// full 24-bit mantissa: integers would be exactly representable in TF32's 10 bits and the test
+/// would pass no matter what the flag did.
+#[test]
+fn compute_type_reaches_cublas() {
+    require_cuda!();
+    let dcpu = DeviceCpuSerial::default();
+    let (m, k, n) = (64usize, 512usize, 64usize);
+
+    let gen = |len: usize, phase: usize| -> Vec<f32> {
+        (0..len).map(|i| (((i * 7 + phase) % 23) as f32 - 11.0) / 7.0).collect()
+    };
+    let (av, bv) = (gen(m * k, 0), gen(k * n, 3));
+
+    // Reference: f64 matmul of the f32 operands, promoted. Exact to f64 rounding.
+    let a64: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((av.iter().map(|v| *v as f64).collect::<Vec<f64>>(), &dcpu)).into_shape([m, k]);
+    let b64: Tensor<f64, DeviceCpuSerial, _> =
+        rt::asarray((bv.iter().map(|v| *v as f64).collect::<Vec<f64>>(), &dcpu)).into_shape([k, n]);
+    let want: Vec<f64> = host_nd(&rt::matmul(&a64, &b64));
+
+    let run = |flag: ComputeType32F| -> Vec<f32> {
+        let mut d = DeviceCuda::new(0);
+        // Per-device override, not the global: a global write here would perturb every other test
+        // running in parallel, and the failure would land somewhere else entirely.
+        d.set_flags_override(Some(CudaRuntimeFlags { compute_type_32f: flag }));
+        let a: Tensor<f32, _, _> = rt::asarray((av.clone(), &d)).into_shape([m, k]);
+        let b: Tensor<f32, _, _> = rt::asarray((bv.clone(), &d)).into_shape([k, n]);
+        host_nd(&rt::matmul(&a, &b))
+    };
+
+    let rel_err = |got: &[f32], want: &[f64]| -> f64 {
+        let num = got.iter().zip(want).map(|(g, w)| (*g as f64 - w).powi(2)).sum::<f64>().sqrt();
+        let den = want.iter().map(|w| w * w).sum::<f64>().sqrt();
+        num / den
+    };
+
+    let e_exact = rel_err(&run(ComputeType32F::Default), &want);
+    let e_tf32 = rel_err(&run(ComputeType32F::FastTF32), &want);
+
+    assert!(e_exact < 1e-5, "f32 gemm on the Default path should be near-exact vs f64: {e_exact:e}");
+    // 10-bit mantissa, ~4.9e-4 unit roundoff; accumulated over k=512 with mixed signs.
+    assert!(e_tf32 < 1e-1, "TF32 should still be accurate to ~1e-4..1e-3: {e_tf32:e}");
+    assert!(
+        e_tf32 > 10.0 * e_exact,
+        "TF32 and Default agree to within rounding ({e_exact:e} vs {e_tf32:e}) — the flag is not \
+         reaching cuBLAS, so the compute-type experiment would measure nothing"
+    );
+
+    // The batched form is a *separate* entry point (`cublasGemmStridedBatchedEx`), and its strides
+    // have their own history: a units bug there once left slice 0 exact and every later slice
+    // unwritten. So it gets its own assertion, and the slices carry different data so a stride error
+    // cannot hide behind repetition.
+    let p = 3usize;
+    let ap: Vec<f32> = (0..p).flat_map(|s| gen(m * k, 5 * s)).collect();
+    let ap64: Vec<f64> = ap.iter().map(|v| *v as f64).collect();
+    let a64b: Tensor<f64, DeviceCpuSerial, _> = rt::asarray((ap64, &dcpu)).into_shape([p, m, k]);
+    let want_b: Vec<f64> = host_nd(&rt::matmul(&a64b, &b64));
+
+    let run_b = |flag: ComputeType32F| -> Vec<f32> {
+        let mut d = DeviceCuda::new(0);
+        d.set_flags_override(Some(CudaRuntimeFlags { compute_type_32f: flag }));
+        let a: Tensor<f32, _, _> = rt::asarray((ap.clone(), &d)).into_shape([p, m, k]);
+        let b: Tensor<f32, _, _> = rt::asarray((bv.clone(), &d)).into_shape([k, n]);
+        host_nd(&rt::matmul(&a, &b))
+    };
+    let eb_exact = rel_err(&run_b(ComputeType32F::Default), &want_b);
+    let eb_tf32 = rel_err(&run_b(ComputeType32F::FastTF32), &want_b);
+    assert!(eb_exact < 1e-5, "batched f32 gemm on the Default path: {eb_exact:e}");
+    assert!(
+        eb_tf32 > 10.0 * eb_exact,
+        "batched TF32 not reaching cuBLAS ({eb_exact:e} vs {eb_tf32:e}) — the stride path is a \
+         different call and needs its own check"
+    );
+}
+
+/* #endregion */

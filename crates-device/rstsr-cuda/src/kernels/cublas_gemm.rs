@@ -37,6 +37,32 @@
 //!
 //! Every refusal is silent: the caller runs the tiled kernel and gets the right answer, slower.
 //!
+//! # Compute type: why there is a second entry point
+//!
+//! `cublasSgemm` has no compute-type argument, so it always multiplies in IEEE fp32 — on an A100
+//! that is the CUDA-core rate (19.5 TFLOP/s), *the same as DFMA*. The tensor-core rate for f32
+//! inputs is reachable only through `cublasGemmEx`, which takes a `cublasComputeType_t` deciding how
+//! the operands are down-converted into the MMA. [`crate::flags::ComputeType32F`] names those
+//! choices, and [`entry_for`] maps them onto the two entry points:
+//!
+//! | flag | entry | what the multiplier does | A100 |
+//! |---|---|---|---|
+//! | `Default` | typed `Sgemm` | IEEE fp32 | 19.5 TFLOP/s |
+//! | `Pedantic` | `gemmEx` `32F_PEDANTIC` | IEEE fp32, no contraction | 19.5 |
+//! | `FastTF32` | `gemmEx` `32F_FAST_TF32` | 10-bit mantissa, 8-bit exponent | 156 |
+//! | `Fast16F` | `gemmEx` `32F_FAST_16F` | fp16 mantissa **and** exponent | 312, range risk |
+//! | `Fast16BF` | `gemmEx` `32F_FAST_16BF` | bf16 mantissa, fp32 exponent | 312 |
+//!
+//! **The data stays `f32` in memory in every row.** The down-conversion happens between the load and
+//! the MMA, so no buffer, kernel, cast or dtype table changes — only the arithmetic. That is what
+//! makes this a flag rather than a second dtype, and why `Fast16BF` is not a substitute for a real
+//! `bf16` storage format: it buys the multiply rate without buying the bandwidth.
+//!
+//! `f64` ignores the flag entirely, [`CublasScalar::ex_compute`] returns `None`, and the typed
+//! `Dgemm` runs: there is no 64-bit compute type that trades precision for rate, and passing a
+//! `32F` compute type against `CUDA_R_64F` operands would make cuBLAS read four bytes of an
+//! eight-byte value.
+//!
 //! # Thread safety
 //!
 //! A `cublasHandle_t` is not thread-safe, and this crate shares one per ordinal (see
@@ -47,6 +73,7 @@
 use cudarc::cublas::sys;
 
 use crate::dtype::CudaDType;
+use crate::flags::ComputeType32F;
 use crate::kernels::gemm::GemmGeom;
 use crate::prelude_dev::*;
 use crate::stream::CublasHandle;
@@ -54,6 +81,17 @@ use crate::stream::CublasHandle;
 /// The float widths cuBLAS's typed `gemm` covers, which is exactly what `DeviceMatMulAPI` is
 /// instantiated for on this device.
 pub trait CublasScalar: CudaDType {
+    /// The `cudaDataType` this type presents to `cublasGemmEx`. Only used on the [`GemmEntry::Ex`]
+    /// path, but it is a property of the type rather than of the call, so it lives here.
+    const DTYPE: sys::cudaDataType;
+
+    /// The compute type to use, or `None` to stay on the typed entry point.
+    ///
+    /// Returning `None` for `Default` is deliberate: the typed `Sgemm` is already IEEE fp32, and
+    /// routing the default case through `gemmEx` would replace a verified code path with an
+    /// unverified one for no gain. `f64` returns `None` for every flag — see the module docs.
+    fn ex_compute(flag: ComputeType32F) -> Option<sys::cublasComputeType_t>;
+
     /// # Safety
     /// `a`, `b`, `c` must be device pointers of at least the extents implied by
     /// `m, n, k, lda, ldb, ldc`, on the stream the handle is bound to.
@@ -97,11 +135,90 @@ pub trait CublasScalar: CudaDType {
         stride_c: i64,
         batch: i32,
     ) -> sys::cublasStatus_t;
+
+    /// `cublasGemmEx`, same contract plus the compute type. `alpha`/`beta` are `Self`, which is
+    /// correct because a `32F` compute type reads them as `f32` — the same width the data has.
+    ///
+    /// # Safety
+    /// As [`Self::gemm`]. `compute` must be one that the current device supports.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemm_ex(
+        handle: sys::cublasHandle_t,
+        transa: sys::cublasOperation_t,
+        transb: sys::cublasOperation_t,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: &Self,
+        a: u64,
+        lda: i32,
+        b: u64,
+        ldb: i32,
+        beta: &Self,
+        c: u64,
+        ldc: i32,
+        compute: sys::cublasComputeType_t,
+    ) -> sys::cublasStatus_t;
+
+    /// Batched [`Self::gemm_ex`].
+    ///
+    /// # Safety
+    /// As [`Self::gemm_strided_batched`], plus the same `compute` requirement.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemm_strided_batched_ex(
+        handle: sys::cublasHandle_t,
+        transa: sys::cublasOperation_t,
+        transb: sys::cublasOperation_t,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: &Self,
+        a: u64,
+        lda: i32,
+        stride_a: i64,
+        b: u64,
+        ldb: i32,
+        stride_b: i64,
+        beta: &Self,
+        c: u64,
+        ldc: i32,
+        stride_c: i64,
+        batch: i32,
+        compute: sys::cublasComputeType_t,
+    ) -> sys::cublasStatus_t;
+}
+
+/// Which cuBLAS entry point a launch uses. Resolved from [`ComputeType32F`] by [`entry_for`], and
+/// carried explicitly so the choice is visible at the call site rather than hidden in a branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GemmEntry {
+    /// `cublasSgemm`/`cublasDgemm` — full-precision arithmetic, the default.
+    Typed,
+    /// `cublasGemmEx` with a down-converting compute type.
+    Ex(sys::cublasComputeType_t),
+}
+
+/// The entry point this dtype takes for this flag.
+///
+/// Total by construction: every flag maps to something, and the types that cannot honour it say so
+/// through [`CublasScalar::ex_compute`] rather than by a runtime check.
+pub(crate) fn entry_for<T: CublasScalar>(flag: ComputeType32F) -> GemmEntry {
+    match T::ex_compute(flag) {
+        Some(compute) => GemmEntry::Ex(compute),
+        None => GemmEntry::Typed,
+    }
 }
 
 macro_rules! impl_cublas_scalar {
-    ($t:ty, $gemm:ident, $gemm_sb:ident) => {
+    ($t:ty, $gemm:ident, $gemm_sb:ident, $dtype:expr, $ex:expr) => {
         impl CublasScalar for $t {
+            const DTYPE: sys::cudaDataType = $dtype;
+
+            fn ex_compute(flag: ComputeType32F) -> Option<sys::cublasComputeType_t> {
+                let f: fn(ComputeType32F) -> Option<sys::cublasComputeType_t> = $ex;
+                f(flag)
+            }
+
             unsafe fn gemm(
                 handle: sys::cublasHandle_t,
                 transa: sys::cublasOperation_t,
@@ -181,12 +298,129 @@ macro_rules! impl_cublas_scalar {
                     )
                 }
             }
+
+            #[allow(clippy::too_many_arguments)]
+            unsafe fn gemm_ex(
+                handle: sys::cublasHandle_t,
+                transa: sys::cublasOperation_t,
+                transb: sys::cublasOperation_t,
+                m: i32,
+                n: i32,
+                k: i32,
+                alpha: &Self,
+                a: u64,
+                lda: i32,
+                b: u64,
+                ldb: i32,
+                beta: &Self,
+                c: u64,
+                ldc: i32,
+                compute: sys::cublasComputeType_t,
+            ) -> sys::cublasStatus_t {
+                unsafe {
+                    sys::cublasGemmEx(
+                        handle,
+                        transa,
+                        transb,
+                        m,
+                        n,
+                        k,
+                        alpha as *const $t as *const core::ffi::c_void,
+                        a as *const core::ffi::c_void,
+                        Self::DTYPE,
+                        lda,
+                        b as *const core::ffi::c_void,
+                        Self::DTYPE,
+                        ldb,
+                        beta as *const $t as *const core::ffi::c_void,
+                        c as *mut core::ffi::c_void,
+                        Self::DTYPE,
+                        ldc,
+                        compute,
+                        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )
+                }
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            unsafe fn gemm_strided_batched_ex(
+                handle: sys::cublasHandle_t,
+                transa: sys::cublasOperation_t,
+                transb: sys::cublasOperation_t,
+                m: i32,
+                n: i32,
+                k: i32,
+                alpha: &Self,
+                a: u64,
+                lda: i32,
+                stride_a: i64,
+                b: u64,
+                ldb: i32,
+                stride_b: i64,
+                beta: &Self,
+                c: u64,
+                ldc: i32,
+                stride_c: i64,
+                batch: i32,
+                compute: sys::cublasComputeType_t,
+            ) -> sys::cublasStatus_t {
+                unsafe {
+                    sys::cublasGemmStridedBatchedEx(
+                        handle,
+                        transa,
+                        transb,
+                        m,
+                        n,
+                        k,
+                        alpha as *const $t as *const core::ffi::c_void,
+                        a as *const core::ffi::c_void,
+                        Self::DTYPE,
+                        lda,
+                        stride_a,
+                        b as *const core::ffi::c_void,
+                        Self::DTYPE,
+                        ldb,
+                        stride_b,
+                        beta as *const $t as *const core::ffi::c_void,
+                        c as *mut core::ffi::c_void,
+                        Self::DTYPE,
+                        ldc,
+                        stride_c,
+                        batch,
+                        compute,
+                        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )
+                }
+            }
         }
     };
 }
 
-impl_cublas_scalar!(f32, cublasSgemm_v2, cublasSgemmStridedBatched);
-impl_cublas_scalar!(f64, cublasDgemm_v2, cublasDgemmStridedBatched);
+impl_cublas_scalar!(
+    f32,
+    cublasSgemm_v2,
+    cublasSgemmStridedBatched,
+    sys::cudaDataType::CUDA_R_32F,
+    |flag| match flag {
+        // The typed `Sgemm` is already IEEE fp32; routing the default through `gemmEx` would swap a
+        // verified path for an unverified one and buy nothing.
+        ComputeType32F::Default => None,
+        ComputeType32F::Pedantic => Some(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC),
+        ComputeType32F::FastTF32 => Some(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32),
+        ComputeType32F::Fast16F => Some(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F),
+        ComputeType32F::Fast16BF => Some(sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF),
+    }
+);
+// `f64` has no down-converting compute type, and a `32F` compute type against `CUDA_R_64F` operands
+// would make cuBLAS read four bytes of an eight-byte value. So the flag is ignored here, including
+// `Pedantic`: the typed `Dgemm` is the pedantic path.
+impl_cublas_scalar!(
+    f64,
+    cublasDgemm_v2,
+    cublasDgemmStridedBatched,
+    sys::cudaDataType::CUDA_R_64F,
+    |_| None
+);
 
 /// One `gemm` call, in cuBLAS's terms.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -347,38 +581,32 @@ pub(crate) unsafe fn launch<T: CublasScalar>(
     ptr_a: u64,
     ptr_b: u64,
     ptr_c: u64,
+    entry: GemmEntry,
 ) -> sys::cublasStatus_t {
     let _api = blas.lock();
     let handle = *blas.blas().handle();
     let (stride_a, stride_b, stride_c) = batch_strides(a);
+    // Slot A holds `geom.b`, slot B holds `geom.a`; the strides follow the buffer, not the slot name.
+    let (ta, tb) = (op(a.transa), op(a.transb));
+    let (mo, no, ko, batch) = (a.mo, a.no, a.ko, a.batch);
+    // One place decides which of the four entry points is used, so the batched and unbatched forms
+    // cannot disagree about whether they honour the compute type.
     unsafe {
-        if a.batch > 1 {
-            T::gemm_strided_batched(
-                handle,
-                op(a.transa),
-                op(a.transb),
-                a.mo,
-                a.no,
-                a.ko,
-                alpha,
-                // slot A holds `geom.b`, slot B holds `geom.a`; the strides follow the buffer.
-                ptr_b,
-                a.lda,
-                stride_a,
-                ptr_a,
-                a.ldb,
-                stride_b,
-                beta,
-                ptr_c,
-                a.ldc,
-                stride_c,
-                a.batch,
-            )
-        } else {
-            T::gemm(
-                handle, op(a.transa), op(a.transb), a.mo, a.no, a.ko, alpha, ptr_b, a.lda, ptr_a, a.ldb, beta, ptr_c,
-                a.ldc,
-            )
+        match (entry, a.batch > 1) {
+            (GemmEntry::Typed, false) => {
+                T::gemm(handle, ta, tb, mo, no, ko, alpha, ptr_b, a.lda, ptr_a, a.ldb, beta, ptr_c, a.ldc)
+            },
+            (GemmEntry::Typed, true) => T::gemm_strided_batched(
+                handle, ta, tb, mo, no, ko, alpha, ptr_b, a.lda, stride_a, ptr_a, a.ldb, stride_b, beta, ptr_c, a.ldc,
+                stride_c, batch,
+            ),
+            (GemmEntry::Ex(compute), false) => T::gemm_ex(
+                handle, ta, tb, mo, no, ko, alpha, ptr_b, a.lda, ptr_a, a.ldb, beta, ptr_c, a.ldc, compute,
+            ),
+            (GemmEntry::Ex(compute), true) => T::gemm_strided_batched_ex(
+                handle, ta, tb, mo, no, ko, alpha, ptr_b, a.lda, stride_a, ptr_a, a.ldb, stride_b, beta, ptr_c, a.ldc,
+                stride_c, batch, compute,
+            ),
         }
     }
 }
@@ -566,5 +794,40 @@ mod tests {
         assert_eq!(args.batch_b, (k * n) as isize);
         assert_eq!(args.batch_c, (m * n) as isize);
         assert!(args.lda >= n as i32 && args.ldb >= k as i32 && args.ldc >= n as i32);
+    }
+
+    /// The flag-to-entry map, which is the whole of the compute-type feature's decision surface.
+    ///
+    /// Two properties matter and are both here: **`Default` must stay on the typed path** (routing
+    /// the default through `gemmEx` would replace the verified code path with an unverified one for
+    /// no gain), and **`f64` must ignore the flag** (a `32F` compute type against `CUDA_R_64F`
+    /// operands would make cuBLAS read four bytes of an eight-byte value — a wrong answer, not an
+    /// error).
+    #[test]
+    fn compute_type_selects_the_entry_point() {
+        use ComputeType32F::*;
+        use sys::cublasComputeType_t as Ct;
+
+        assert_eq!(entry_for::<f32>(Default), GemmEntry::Typed, "the default stays exact");
+        assert_eq!(entry_for::<f32>(Pedantic), GemmEntry::Ex(Ct::CUBLAS_COMPUTE_32F_PEDANTIC));
+        assert_eq!(entry_for::<f32>(FastTF32), GemmEntry::Ex(Ct::CUBLAS_COMPUTE_32F_FAST_TF32));
+        assert_eq!(entry_for::<f32>(Fast16F), GemmEntry::Ex(Ct::CUBLAS_COMPUTE_32F_FAST_16F));
+        assert_eq!(entry_for::<f32>(Fast16BF), GemmEntry::Ex(Ct::CUBLAS_COMPUTE_32F_FAST_16BF));
+
+        for flag in [Default, Pedantic, FastTF32, Fast16F, Fast16BF] {
+            assert_eq!(entry_for::<f64>(flag), GemmEntry::Typed, "f64 ignores the flag");
+        }
+
+        // An `Ex` entry must never be produced for `Default` on either width: that is the one
+        // combination where a silent change would alter every existing result.
+        assert!(matches!(entry_for::<f32>(Default), GemmEntry::Typed));
+    }
+
+    /// The declared `cudaDataType` must match the width, because `gemmEx` reads the pointers
+    /// according to it and nothing else. A mismatch here is a silent misread, not a type error.
+    #[test]
+    fn declared_dtype_matches_the_width() {
+        assert_eq!(<f32 as CublasScalar>::DTYPE, sys::cudaDataType::CUDA_R_32F);
+        assert_eq!(<f64 as CublasScalar>::DTYPE, sys::cudaDataType::CUDA_R_64F);
     }
 }

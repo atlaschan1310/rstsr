@@ -82,6 +82,15 @@
 //! the same mathematical function — accurate to the last ulp, by a different route than Rust's libm.
 //! No flag makes them bit-identical, and nothing here pretends otherwise.
 //!
+//! **Narrower arithmetic, on request.** `RSTSR_CUDA_COMPUTE_TYPE_32F=fasttf32|fast16f|fast16bf` routes
+//! f32 `matmul` through `cublasGemmEx` with a down-converting compute type: the operands stay f32 in
+//! memory, but the tensor core multiplies 10- or 7-bit mantissas. This is the only knob that changes
+//! results *on purpose* rather than as a side effect of ordering, and it is off by default —
+//! `Default` keeps the typed `Sgemm`, which is IEEE fp32. It buys the tensor-core rate (on an A100,
+//! 19.5 → 156 → 312 TFLOP/s for fp32/TF32/bf16 math); whether the narrower mantissa is acceptable is
+//! a property of the caller's algorithm, not of this crate, so nothing here decides it for you. `f64`
+//! ignores the flag: there is no 64-bit compute type that trades precision for rate.
+//!
 //! The practical rule: compare against the CPU with a **tolerance**, never with `==`. That is what
 //! this crate's tests do (`assert_close`, `ATOL 1e-9`), and what any cross-implementation comparison
 //! of floating point has to do. Reproducibility *across runs* is guaranteed; identity *with the CPU*
@@ -110,6 +119,12 @@
 //! - `RSTSR_CUDA_STRICT_FP=1` compiles with `--fmad=false`, removing FMA contraction from the
 //!   kernels that can use it (`l2_norm`, `var`, `vecdot`). See the numerics section above for what
 //!   this does and does not recover.
+//! - `RSTSR_CUDA_COMPUTE_TYPE_32F=default|pedantic|fasttf32|fast16f|fast16bf` selects the cuBLAS
+//!   compute type for **f32** `matmul` (`f64` ignores it). `fasttf32` is the one to try first: 10-bit
+//!   mantissa, f32 exponent range, ~8× the f32 rate on Ampere. `fast16f` is the variant to avoid on
+//!   integrals — fp16's 5-bit exponent underflows below ≈6e-5, where bf16 does not. A compute type
+//!   the device refuses falls back to exact arithmetic with a one-time warning, so "the flag did
+//!   nothing" is distinguishable from "the flag never arrived".
 //! - `RSTSR_CUDA_ARCH=compute_80` compiles for an arch other than the card's own. Diagnostic only:
 //!   PTX is forward-compatible, so an sm_86 card will host `compute_75`/`compute_80`/`compute_86`
 //!   and an sm_90 will host everything below it. That is what makes an arch matrix possible from a
