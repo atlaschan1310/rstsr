@@ -91,6 +91,13 @@
 //! a property of the caller's algorithm, not of this crate, so nothing here decides it for you. `f64`
 //! ignores the flag: there is no 64-bit compute type that trades precision for rate.
 //!
+//! The mantissa is not the only thing that changes. `fast16f` also bounds the *inputs* (below ≈6e-5
+//! and above 65504, the range of a 5-bit exponent), so on data spanning many decades it fails
+//! differently rather than merely worse; `fasttf32` and `fast16bf` keep fp32's 8-bit exponent and
+//! have no such bound. `tests/test_kernels.rs` pins both statements: `rel_l2` against an f64
+//! reference built from the same f32 operands, since the flag is about the arithmetic and nothing
+//! else.
+//!
 //! The practical rule: compare against the CPU with a **tolerance**, never with `==`. That is what
 //! this crate's tests do (`assert_close`, `ATOL 1e-9`), and what any cross-implementation comparison
 //! of floating point has to do. Reproducibility *across runs* is guaranteed; identity *with the CPU*
@@ -122,7 +129,8 @@
 //! - `RSTSR_CUDA_COMPUTE_TYPE_32F=default|pedantic|fasttf32|fast16f|fast16bf` selects the cuBLAS
 //!   compute type for **f32** `matmul` (`f64` ignores it). `fasttf32` is the one to try first: 10-bit
 //!   mantissa, f32 exponent range, ~8× the f32 rate on Ampere. `fast16f` is the variant to avoid on
-//!   integrals — fp16's 5-bit exponent underflows below ≈6e-5, where bf16 does not. A compute type
+//!   integrals — fp16's 5-bit exponent underflows below ≈6e-5 and overflows above 65504, so it is a
+//!   mode with an input *range*, not merely a wider error bar; bf16 has fp32's range. A compute type
 //!   the device refuses falls back to exact arithmetic with a one-time warning, so "the flag did
 //!   nothing" is distinguishable from "the flag never arrived".
 //! - `RSTSR_CUDA_ARCH=compute_80` compiles for an arch other than the card's own. Diagnostic only:
