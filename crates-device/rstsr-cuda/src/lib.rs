@@ -86,17 +86,24 @@
 //! f32 `matmul` through `cublasGemmEx` with a down-converting compute type: the operands stay f32 in
 //! memory, but the tensor core multiplies 10- or 7-bit mantissas. This is the only knob that changes
 //! results *on purpose* rather than as a side effect of ordering, and it is off by default —
-//! `Default` keeps the typed `Sgemm`, which is IEEE fp32. It buys the tensor-core rate (on an A100,
-//! 19.5 → 156 → 312 TFLOP/s for fp32/TF32/bf16 math); whether the narrower mantissa is acceptable is
-//! a property of the caller's algorithm, not of this crate, so nothing here decides it for you. `f64`
-//! ignores the flag: there is no 64-bit compute type that trades precision for rate.
+//! `Default` keeps the typed `Sgemm`, which is IEEE fp32. The rates are the tensor-core rates (on an
+//! A100, 19.5 → 156 → 312 TFLOP/s for fp32/TF32/bf16 math); whether the narrower mantissa is
+//! acceptable is a property of the caller's algorithm, not of this crate, so nothing here decides it
+//! for you. `f64` ignores the flag: there is no 64-bit compute type that trades precision for rate.
+//!
+//! **The flag is a licence, not a switch.** The cuBLAS manual says these compute types *allow* the
+//! library to down-convert, and offers no way to require it: on an A100 the same `fast16f` call
+//! returned an exactly-fp32 answer for one shape and no diagnostic, so "the flag is set" does not
+//! imply "the arithmetic changed". Engagement is the library's choice and can depend on the shape —
+//! which is a reason to treat these as experiments and measure, not as settings to rely on.
 //!
 //! The mantissa is not the only thing that changes. `fast16f` also bounds the *inputs* (below ≈6e-5
 //! and above 65504, the range of a 5-bit exponent), so on data spanning many decades it fails
-//! differently rather than merely worse; `fasttf32` and `fast16bf` keep fp32's 8-bit exponent and
-//! have no such bound. `tests/test_kernels.rs` pins both statements: `rel_l2` against an f64
-//! reference built from the same f32 operands, since the flag is about the arithmetic and nothing
-//! else.
+//! differently rather than merely worse — `inf`, not a degraded value — while `fasttf32` and
+//! `fast16bf` keep fp32's 8-bit exponent and have no such bound. Combined with the paragraph above,
+//! `fast16f` is the one to avoid on integrals: whether it engages is unpredictable, and when it does
+//! it can destroy the answer rather than shorten it. `tests/test_kernels.rs` pins what is pinnable:
+//! TF32 must engage, and 16F must never land between "exact" and "clearly broken".
 //!
 //! The practical rule: compare against the CPU with a **tolerance**, never with `==`. That is what
 //! this crate's tests do (`assert_close`, `ATOL 1e-9`), and what any cross-implementation comparison
@@ -128,11 +135,14 @@
 //!   this does and does not recover.
 //! - `RSTSR_CUDA_COMPUTE_TYPE_32F=default|pedantic|fasttf32|fast16f|fast16bf` selects the cuBLAS
 //!   compute type for **f32** `matmul` (`f64` ignores it). `fasttf32` is the one to try first: 10-bit
-//!   mantissa, f32 exponent range, ~8× the f32 rate on Ampere. `fast16f` is the variant to avoid on
-//!   integrals — fp16's 5-bit exponent underflows below ≈6e-5 and overflows above 65504, so it is a
-//!   mode with an input *range*, not merely a wider error bar; bf16 has fp32's range. A compute type
-//!   the device refuses falls back to exact arithmetic with a one-time warning, so "the flag did
-//!   nothing" is distinguishable from "the flag never arrived".
+//!   mantissa, f32 exponent range, ~8× the f32 rate on Ampere. All three fast types are permissions
+//!   rather than commands — cuBLAS may keep fp32 and report nothing — so measure rather than assume.
+//!   `fast16f` is the variant to avoid on integrals: fp16's 5-bit exponent underflows below ≈6e-5 and
+//!   overflows above 65504, so it is a mode with an input *range*, not merely a wider error bar, and
+//!   whether it is the mode you got is unknown; bf16 has fp32's range. A compute type the *device*
+//!   refuses falls back to exact arithmetic with a one-time warning. A compute type the *library*
+//!   simply does not take up is silent, and looks exactly like a refusal from the outside — so treat
+//!   a missing speedup as the expected outcome and measure it, rather than as a bug to chase.
 //! - `RSTSR_CUDA_ARCH=compute_80` compiles for an arch other than the card's own. Diagnostic only:
 //!   PTX is forward-compatible, so an sm_86 card will host `compute_75`/`compute_80`/`compute_86`
 //!   and an sm_90 will host everything below it. That is what makes an arch matrix possible from a

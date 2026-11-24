@@ -2128,76 +2128,111 @@ fn compute_type_reaches_cublas() {
     );
 }
 
-/// The three fast modes are not interchangeable: only `Fast16F` can lose the *number*, not just
-/// digits.
+/// The `FAST_*` compute types are a *licence*, not a switch: cuBLAS may compute in fp32 anyway.
 ///
-/// fp16 has a 5-bit exponent — it saturates at 65504 and has nothing to say below ~6e-8. TF32 and
-/// bf16 keep fp32's 8-bit exponent and differ only in the mantissa, so their error is a fixed
-/// *relative* amount at every scale. For chemistry data, where entries span many decades (a
-/// partially-transformed integral, a density matrix, an orbital energy), that is the difference
-/// between losing digits and losing the value.
+/// The manual says "**Allows** the library to use Tensor Cores with automatic down-conversion",
+/// for all three fast types. There is no promise that it will, no status bit to say which way it
+/// went, and an exact answer is therefore a legal outcome — this test exists because the first
+/// version of it assumed otherwise and failed on an A100 with a relative error of `4.7e-8`, i.e. a
+/// perfectly exact fp32 matmul.
 ///
-/// The claim is about representability, so the fixture is deliberately **all-positive** at ~1e5:
-/// additions then do not cancel, the sums sit at `k·1e10`, and the measured error is the mantissa
-/// and nothing else. A mixed-sign fixture would instead test error *amplification* by cancellation,
-/// which is a property of this matrix, not of the compute type.
+/// So the assertions are the ones the contract supports:
 ///
-/// This test also documents a real constraint rather than a preference: `Fast16F` is not a
-/// "slightly less accurate TF32", it is a mode with an input range, and this backend neither clamps
-/// nor rescales to stay inside it. Whichever way the conversion fails — overflow to `inf`, or
-/// saturation at 65504 — the answer stops being an approximation of the product.
+/// - **TF32 must engage**, at the shape where it is known to (`64x512x64`, the shape
+///   [`compute_type_reaches_cublas`] uses). Without this control, "16F did not engage" cannot be
+///   distinguished from "this shape never reaches cuBLAS at all".
+/// - **16F and 16BF may engage or not**, and the test reports which, per shape. What it refuses to
+///   accept is the middle: an answer that is neither exact nor predictably broken. That middle is
+///   the only genuinely alarming regime — it would mean a conversion this crate cannot characterise.
+/// - **If 16F engages, the range claim holds.** fp16 has a 5-bit exponent: it saturates at 65504 and
+///   has nothing to say below ~6e-8, so on inputs at ~1e5 the result is `inf` (overflow) or off by
+///   an O(1) factor (saturation), never "three digits worse".
+///
+/// The fixture is deliberately **all-positive** at ~1e5: additions then do not cancel, the sums sit
+/// at `k*1e10`, and a measured error is the mantissa alone. A mixed-sign fixture would instead test
+/// error amplification by cancellation, which is a property of the matrix, not of the compute type.
+///
+/// Run this with `--nocapture` to get the engagement map; it prints one line per (shape, flag).
 #[test]
-fn fast16f_loses_the_exponent_range() {
+fn compute_type_engagement_is_the_librarys_choice() {
     require_cuda!();
     let dcpu = DeviceCpuSerial::default();
-    let (m, k, n) = (48usize, 64usize, 48usize);
 
+    // (m, k, n): the shape TF32 is known to engage at, and the small one that first showed this
+    // behaviour. Engagement is size-dependent — that is the point of testing both.
+    let shapes = [(64usize, 512usize, 64usize), (48, 64, 48)];
     let gen = |len: usize, phase: usize| -> Vec<f32> {
         (0..len).map(|i| 1.0e5 + ((i * 7 + phase) % 29) as f32).collect()
     };
-    let (av, bv) = (gen(m * k, 0), gen(k * n, 3));
 
-    // f64 reference from the *same* f32 inputs. Every entry exceeds fp16's 65504 ceiling, which is
-    // the whole point; it is nowhere near fp32's 3.4e38 ceiling.
-    let a64: Tensor<f64, DeviceCpuSerial, _> =
-        rt::asarray((av.iter().map(|v| *v as f64).collect::<Vec<f64>>(), &dcpu)).into_shape([m, k]);
-    let b64: Tensor<f64, DeviceCpuSerial, _> =
-        rt::asarray((bv.iter().map(|v| *v as f64).collect::<Vec<f64>>(), &dcpu)).into_shape([k, n]);
-    let want: Vec<f64> = host_nd(&rt::matmul(&a64, &b64));
+    for (m, k, n) in shapes {
+        let (av, bv) = (gen(m * k, 0), gen(k * n, 3));
 
-    let run = |flag: ComputeType32F| -> Vec<f32> {
-        let mut d = DeviceCuda::new(0);
-        d.set_flags_override(Some(CudaRuntimeFlags { compute_type_32f: flag }));
-        let a: Tensor<f32, _, _> = rt::asarray((av.clone(), &d)).into_shape([m, k]);
-        let b: Tensor<f32, _, _> = rt::asarray((bv.clone(), &d)).into_shape([k, n]);
-        host_nd(&rt::matmul(&a, &b))
-    };
+        // f64 reference from the *same* f32 inputs. Every entry exceeds fp16's 65504 ceiling, which
+        // is the whole point; it is nowhere near fp32's 3.4e38 ceiling.
+        let a64: Tensor<f64, DeviceCpuSerial, _> =
+            rt::asarray((av.iter().map(|v| *v as f64).collect::<Vec<f64>>(), &dcpu)).into_shape([m, k]);
+        let b64: Tensor<f64, DeviceCpuSerial, _> =
+            rt::asarray((bv.iter().map(|v| *v as f64).collect::<Vec<f64>>(), &dcpu)).into_shape([k, n]);
+        let want: Vec<f64> = host_nd(&rt::matmul(&a64, &b64));
 
-    // 8-bit exponent = fp32's range: finite, and wrong only in the mantissa.
-    for flag in [ComputeType32F::Default, ComputeType32F::FastTF32, ComputeType32F::Fast16BF] {
-        let got = run(flag);
+        let run = |flag: ComputeType32F| -> Vec<f32> {
+            let mut d = DeviceCuda::new(0);
+            d.set_flags_override(Some(CudaRuntimeFlags { compute_type_32f: flag }));
+            let a: Tensor<f32, _, _> = rt::asarray((av.clone(), &d)).into_shape([m, k]);
+            let b: Tensor<f32, _, _> = rt::asarray((bv.clone(), &d)).into_shape([k, n]);
+            host_nd(&rt::matmul(&a, &b))
+        };
+
+        let e_exact = rel_l2(&run(ComputeType32F::Default), &want);
+        assert!(e_exact < 1e-5, "the typed path should be near-exact vs f64: {e_exact:e}");
+        // "Engaged" is defined against the typed path rather than an absolute number: any conversion
+        // to a narrower format has to show up as a departure from fp32 rounding.
+        let engaged = |e: f64| e > 10.0 * e_exact;
+
+        // Control: TF32 is the one mode that is expected to engage, because on Ampere it is the
+        // ordinary f32 path rather than an extra conversion. If it stops engaging at this shape the
+        // rest of this test says nothing.
+        let e_tf32 = rel_l2(&run(ComputeType32F::FastTF32), &want);
+        eprintln!("[{m}x{k}x{n}] fasttf32: e={e_tf32:e} engaged={}", engaged(e_tf32));
+        if (m, k, n) == (64, 512, 64) {
+            assert!(
+                engaged(e_tf32),
+                "TF32 did not engage even at {m}x{k}x{n} ({e_exact:e} vs {e_tf32:e}) — the control \
+                 for this test, so the compute type is not reaching cuBLAS at a shape where it \
+                 already did"
+            );
+        }
+        assert!(e_tf32 < 1e-1, "TF32 engaged but reads the operands wrongly: {e_tf32:e}");
+
+        // bf16 keeps fp32's 8-bit exponent, so engagement can only cost mantissa digits.
+        let e_bf = rel_l2(&run(ComputeType32F::Fast16BF), &want);
+        eprintln!("[{m}x{k}x{n}] fast16bf: e={e_bf:e} engaged={}", engaged(e_bf));
         assert!(
-            got.iter().all(|v| v.is_finite()),
-            "{flag:?} overflowed at ~1e5 magnitude, which an 8-bit exponent cannot do — either the \
-             dtype declared to cuBLAS is wrong or the operands were interpreted as fp16"
+            e_bf < 1e-1,
+            "16BF is off by more than a mantissa ({e_bf:e}) — bf16 has fp32's exponent range, so \
+             this cannot be a range effect"
         );
-        let e = rel_l2(&got, &want);
-        // Same-sign accumulation: ~5e-4 coherent for TF32, ~4e-3 for bf16, both far inside 1e-1.
-        assert!(e < 1e-1, "{flag:?} should stay within the mantissa at this magnitude: {e:e}");
-    }
 
-    // 5-bit exponent = a hard input range. The failure is not "three digits worse", it is a result
-    // that is no longer related to the product by any relative bound — `inf` if the conversion
-    // overflows, or the value of 65504 if it saturates, and rel_l2 is `1e-1..1e0` either way.
-    let got16f = run(ComputeType32F::Fast16F);
-    let finite = got16f.iter().all(|v| v.is_finite());
-    let e16f = rel_l2(&got16f, &want);
-    assert!(
-        !finite || e16f.is_nan() || e16f > 1e-2,
-        "Fast16F stayed finite and accurate ({e16f:e}) for inputs above fp16's 65504 ceiling. Either \
-         the flag is not reaching cuBLAS, or this device refused the compute type and fell back to \
-         exact arithmetic (see the one-time warning) — on sm_80 neither is expected"
-    );
+        // fp16 does not, and that is the difference between the two 16-bit modes.
+        let got16f = run(ComputeType32F::Fast16F);
+        let finite = got16f.iter().all(|v| v.is_finite());
+        let e_16f = rel_l2(&got16f, &want);
+        eprintln!(
+            "[{m}x{k}x{n}] fast16f: e={e_16f:e} finite={finite} engaged={}",
+            engaged(e_16f)
+        );
+        if engaged(e_16f) || !finite {
+            assert!(
+                !finite || e_16f.is_nan() || e_16f > 1e-2,
+                "16F engaged and returned a *nearly* right answer ({e_16f:e}). A 5-bit exponent at \
+                 ~1e5 magnitude cannot do that: the result should be inf or wrong by an O(1) \
+                 factor. Something is converting the operands that this crate does not model"
+            );
+        }
+        // Not engaging is allowed and is not a failure: the manual says "Allows the library to use",
+        // so keeping fp32 is legal. That is exactly why this flag cannot be sold as a rate.
+    }
 }
 
 /// The `OP_T` orientation — a `swapaxes`d operand, which is what `tensordot` hands cuBLAS when the

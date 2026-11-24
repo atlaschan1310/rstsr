@@ -388,6 +388,35 @@ fn debug_gemm() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("RSTSR_CUDA_DEBUG_GEMM").is_some())
 }
 
+/// Say once per compute type that cuBLAS refused it and the answer came from the tiled kernel.
+///
+/// A bitmask rather than a `Once`, because the interesting case is *two* refused flags in one
+/// process — `fasttf32` and `fast16bf` on a pre-Ampere card — and one `Once` would report the first
+/// and silently swallow the second, leaving the same "did it arrive?" ambiguity the message is for.
+///
+/// Only a refusal is detectable: a compute type the library accepts but does not take up (it is
+/// documented as *allowing* the down-conversion) returns success and computes in fp32, and there is
+/// no status or query to distinguish that from having been honoured. See the numerics section of
+/// the crate docs.
+fn warn_refused_once(flag: ComputeType32F, status: cudarc::cublas::sys::cublasStatus_t) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static SEEN: AtomicU8 = AtomicU8::new(0);
+    let bit = 1u8
+        << match flag {
+            ComputeType32F::Default => 0,
+            ComputeType32F::Pedantic => 1,
+            ComputeType32F::Fast16F => 2,
+            ComputeType32F::Fast16BF => 3,
+            ComputeType32F::FastTF32 => 4,
+        };
+    if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        eprintln!(
+            "[rstsr-cuda gemm] cuBLAS refused compute type {flag:?} ({status:?}); falling back to \
+             full-precision arithmetic. The result is exact, the speedup is not there."
+        );
+    }
+}
+
 /// Launch `c = alpha * a @ b + beta * c` on the layout the tier already validated.
 ///
 /// `c` is taken by shared reference on purpose: its element type is either `T` (the `beta` path) or
@@ -483,17 +512,12 @@ where
             }
             // A refused compute type is otherwise indistinguishable from "the flag did nothing":
             // the fallback below is exact, so the only symptom is the *absence* of a speedup. Say
-            // it once — `fasttf32` on a pre-Ampere device, or a shape cuBLAS declines to run in
-            // that mode, both land here.
+            // it once per compute type — `fasttf32` on a pre-Ampere device, or a shape cuBLAS
+            // declines to run in that mode, both land here. Once *per type* rather than once per
+            // process, because a single `Once` let a refusal of `fasttf32` silence the warning for
+            // `fast16bf`, which is the same ambiguity this message exists to remove.
             if matches!(entry, cublas_gemm::GemmEntry::Ex(_)) {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    eprintln!(
-                        "[rstsr-cuda gemm] cuBLAS refused compute type {:?} ({status:?}); falling back to \
-                         full-precision arithmetic. The result is exact, the speedup is not there.",
-                        device.compute_type_32f()
-                    );
-                });
+                warn_refused_once(device.compute_type_32f(), status);
             }
         }
     }
